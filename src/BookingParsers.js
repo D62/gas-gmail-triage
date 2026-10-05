@@ -60,8 +60,7 @@ function bcSchemaDate_(val) {
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) iso = s;
   else if (/^\d{4}-\d{2}-\d{2}$/.test(s)) iso = s + 'T00:00:00';
   if (!iso) return null;
-  // Matches the digit pattern but may still be an impossible date (month 13, etc.)
-  return isNaN(new Date(iso.slice(0, 19) + 'Z').getTime()) ? null : iso;
+  return isNaN(new Date(iso.slice(0, 19) + 'Z').getTime()) ? null : iso; // digit-shaped but impossible (month 13…)
 }
 function bcCategoryActive_(cat) {
   const map = { train: 'transport', flight: 'transport', hotel: 'accommodation', event: 'show', appointment_medical: 'appointment_medical', appointment_personal: 'appointment_personal', meeting: 'meeting' };
@@ -138,8 +137,7 @@ function bcSchemaLodging_(obj, domain) {
   };
 }
 
-// schema.org Event subtypes — used when available instead of guessing the
-// emoji from the title text alone.
+// schema.org Event subtypes, used when available instead of guessing from the title.
 const bcEventTypeEmoji = {
   MusicEvent: '🎵',
   TheaterEvent: '🎭',
@@ -161,10 +159,7 @@ function bcSchemaEventRes_(obj, domain) {
   const loc = (isObj ? rf.location : null) || obj.location || {};
   const locName = typeof loc === 'object' ? (loc.name || '') : String(loc || '');
   const address = typeof loc === 'object' ? (typeof loc.address === 'string' ? loc.address : (loc.address?.streetAddress || '')) : '';
-  // No venue/address at all is a strong sign of broken/sparse markup (seen
-  // on some ticket resale sites where reservationFor.name ends up being the
-  // buyer's own name instead of the event). Bail so ICS/AI get a chance
-  // instead of locking in a garbage title with nothing to show for it.
+  // No venue/address at all is a sign of broken markup — bail so ICS/AI get a chance.
   if (!locName && !address) return null;
   const ref = bcSchemaGet_(obj, 'reservationNumber') || '';
   const rfType = isObj ? bcSchemaType_(rf) : '';
@@ -238,19 +233,13 @@ function bcIcsToEvent_(parsed, ctx, cat) {
   const resolved = cat || (route && route.cat) || 'event';
   const isMedical = resolved === 'appointment_medical';
   const dur = bcDefaultDuration[isMedical ? 'appointment' : resolved] || 60;
-  // Also check the subject line and ICS description for a genre hint — a
-  // ticket's title is often just an artist/act name with none. Deliberately
-  // NOT the full email body: footers/widgets ("Chat with us") produce false
-  // matches (e.g. "chat" tripping the pets/vet rule).
+  // Subject + description, not the full body (footers/widgets like "Chat with us" false-match).
   const dep = (route && route.dep) || '';
   const arr = (route && route.arr) || '';
   const emoji = bcPickEmoji_(resolved, (dep && arr ? dep + ' ' + arr : rawTitle) + ' ' + (parsed.description || '') + ' ' + ctx.subject);
 
-  // A missing DTEND is not a real arrival time. The description sometimes
-  // still states it ("Arrivée: … 08:57"). That clock is local to the arrival
-  // station: 08:57 at St Pancras is 09:57 in Paris, a 1h22 trip, not 22 min.
-  // A pure guess stays in the departure zone — labeling a Paris wall-clock
-  // with London turns "start + 3h" into a 4h block.
+  // Arrival time may only be stated in the description ("Arrivée: … 08:57"),
+  // local to the arrival station — resolve its own zone, not the departure one.
   const fromDescription = !parsed.end && bcArrivalFromText_(parsed.description, parsed.start.dt);
   const statedEnd = parsed.end?.dt || fromDescription;
   const endEstimated = !statedEnd;
@@ -286,11 +275,8 @@ function bcGcalLinkToEvent_(url, ctx, cat) {
     const toLocal = datesUtc ? bcUtcToLocal_ : (s => s.slice(0,4)+'-'+s.slice(4,6)+'-'+s.slice(6,8)+'T'+s.slice(9,11)+':'+s.slice(11,13)+':'+s.slice(13,15));
     const ticketLink = ctx.links.find(x => /t[eé]l[eé]charg|e.?ticket|download.*ticket|ticket.*download/i.test(x.text));
     const rawTitle = params.text || ctx.subject;
-    // Subject only, not the full body — footers/widgets ("Chat with us")
-    // produce false matches against the full text.
     const emoji = bcPickEmoji_(cat || 'event', rawTitle + ' ' + ctx.subject);
-    // Same floating-time problem as ICS attachments (see bcIcsLegTz_): a
-    // Google Calendar "add" link carries no per-leg TZID either.
+    // A Google Calendar "add" link has no per-leg TZID either.
     const [depText, arrText] = bcSplitRoute_(rawTitle + ' ' + (params.location || ''));
     const tzStart = datesUtc ? BC.TIMEZONE : (bcLegTz_(depText) || BC.TIMEZONE);
     const tzEnd = datesUtc ? BC.TIMEZONE : (bcLegTz_(arrText || depText) || BC.TIMEZONE);
@@ -367,11 +353,7 @@ function bcAiParseResult_(raw, providerName, model) {
     const parsed = JSON.parse(raw.match(/\[[\s\S]*\]/)[0]);
     return [].concat(parsed).filter(e => e && e.start).map(e => {
       const cat = e.category || 'event';
-      // Only flight/train have two different locations, so only those can
-      // need two different zones. The model is asked for literal local
-      // times per leg, not converted — our own IATA/city lookup resolves
-      // the actual zone from "location"/"destination" (an LLM doing
-      // timezone arithmetic itself is the unreliable part we're avoiding).
+      // Model reports literal local times per leg; our own lookup resolves the zone.
       const isTransport = cat === 'train' || cat === 'flight';
       const dep = e.location || '';
       const arr = e.destination || '';

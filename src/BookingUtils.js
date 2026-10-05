@@ -62,10 +62,8 @@ const bcMonthMap = {
 };
 const bcMonthNamesRe = Object.keys(bcMonthMap).sort((a, b) => b.length - a.length).join('|');
 
-// Pulls plausible calendar dates (YYYY-MM-DD) out of free text, no AI
-// involved — ISO, numeric DD/MM/YYYY-ish, and "6 October 2026" /
-// "October 6, 2026" style in several languages. Used to scope a cheap
-// Calendar lookup to the actual booking window instead of guessing broadly.
+// Pulls plausible dates (YYYY-MM-DD) out of free text with no AI — ISO,
+// numeric, and "6 October 2026" style in several languages.
 function bcExtractDates_(text) {
   const t = bcNormalize_(text);
   const dates = new Set();
@@ -82,10 +80,7 @@ function bcExtractDates_(text) {
   return [...dates].sort();
 }
 
-// True if two titles share at least half the significant (>2 char) words of
-// the shorter one — catches same-event matches when the two sources word the
-// location so differently that neither is a substring of the other (e.g. a
-// university's full name vs just the amphitheatre name).
+// True if two titles share at least half the significant words of the shorter one.
 function bcTitleSimilar_(a, b) {
   const words = s => new Set(bcNormalize_(s).replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2));
   const wa = words(a), wb = words(b);
@@ -99,9 +94,7 @@ function bcTicketsFolder_() {
   if (!id) throw new Error('TICKETS_FOLDER_ID is not set — add it via setupConfig().');
   return DriveApp.getFolderById(id);
 }
-// Returns null when nothing is recognized, unlike bcTzCity_ below — callers
-// that need to tell "no match" apart from "matched the home timezone" (e.g.
-// guessing a leg's zone from free text) use this one.
+// Unlike bcTzCity_, returns null (not a default) when nothing is recognized.
 function bcTzCityGuess_(s) {
   const n = bcNormalize_(s);
   if (/londres|london|heathrow|gatwick|st.?\s?pancras|stansted|luton|edinb|manchester|glasgow|liverpool|birmingham/.test(n)) return 'Europe/London';
@@ -125,14 +118,9 @@ const bcIataTz = {
 };
 function bcTzIata_(code, city) { return bcIataTz[code] || bcTzCity_(city || ''); }
 
-// Best-effort timezone guess for ONE leg of a trip from free text (title,
-// location, or one half of a split route) — a known city/station name
-// first, then a bare 3-letter IATA code. Returns null (not a default) so
-// callers can tell "nothing recognized" apart from "recognized as home",
-// which matters when departure and arrival need different zones (e.g. a
-// Eurostar leaving Lille at 08:40 local and arriving London at 09:00 local
-// is a 1h20 trip, not 20 minutes — collapsing both ends to the same zone
-// silently produces the wrong duration).
+// Timezone guess for one leg of a trip (city/station name, then IATA code).
+// Returns null rather than a default so departure/arrival can resolve to
+// different zones instead of both collapsing to the home one.
 function bcLegTz_(text) {
   const s = String(text || '');
   const cityTz = bcTzCityGuess_(s);
@@ -141,10 +129,7 @@ function bcLegTz_(text) {
   return iata ? (bcIataTz[iata[1]] || null) : null;
 }
 
-// "A → B" / "A - B" / "A to B" / "A vers B": splits a route-style string
-// into its two legs so each side can be resolved to its own timezone via
-// bcLegTz_ — mirrors the "dep → arr" title convention schema.org
-// train/flight events already use.
+// Splits "A → B" / "A - B" / "A to B" / "A vers B" into its two legs.
 function bcSplitRoute_(text) {
   const s = String(text || '').replace(/\s+/g, ' ').trim();
   const m = s.match(/^(.+?)\s*(?:→|->|—|\bto\b|\bvers\b)\s*(.+)$/i);
@@ -159,9 +144,7 @@ function bcCleanStop_(s) {
     .trim();
 }
 
-// "(48 mins.)" or "(1 hour and 22 mins" (the closing paren is often lost
-// when a trailing "." + ")" is read as a file extension). Always return a
-// balanced "(...)".
+// Extracts a duration like "(48 mins.)", always returning a balanced "(...)".
 function bcTripDuration_(text) {
   const raw = String(text || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ');
   const m = raw.match(/\(\s*(\d[^)]*?)(?:\)|\s*$)/);
@@ -171,9 +154,8 @@ function bcTripDuration_(text) {
   return '(' + inner + ')';
 }
 
-// Some rail confirmations omit DTEND and put the arrival in the
-// description instead: "Arrivée: Mardi, 06 Octobre 2026, 07:33".
-// Returns a local datetime, or ''.
+// Some rail confirmations omit DTEND and state the arrival in the
+// description instead ("Arrivée: ... 07:33"). Returns a local datetime, or ''.
 function bcArrivalFromText_(text, startDt) {
   const line = (String(text || '').match(/arriv(?:ée|ee|al)\s*:\s*([^\n]+)/i) || [])[1];
   if (!line) return '';
@@ -208,11 +190,9 @@ function bcRouteText_(t) {
   return s;
 }
 
-// Rail/flight files rarely say "A → B" directly — corporate travel tools
-// tend to format it as e.g. "RAIL STATION A - STATION B 123456" or
-// "from STATION A -> STATION B (33 mins.)". Returns { cat, dep, arr,
-// duration } when the text is a transport leg. dep/arr are empty when the
-// category is clear but the two stops are not.
+// Rail/flight confirmations rarely say "A → B" directly (e.g. "RAIL STATION
+// A - STATION B 123456"). Returns { cat, dep, arr, duration } when the
+// text is a transport leg; dep/arr are empty if the stops aren't parseable.
 function bcTransportEndpoints_(parts) {
   const texts = [].concat(parts).filter(Boolean).map(bcRouteText_);
   let duration = '';
@@ -331,12 +311,10 @@ function bcPreDepartureEv_(ev) {
 function bcIsoToMs_(iso) { return new Date((iso.length === 10 ? iso + 'T00:00:00' : iso) + 'Z').getTime(); }
 const bcConnectionGapMax = 12 * 60; // minutes — beyond this, legs are treated as unrelated
 
-// Pairs up consecutive flight/train legs that are close enough in time to be
-// the same journey. Flight→flight connections get one "Connection" block
-// spanning the whole layover and skip the per-leg security buffer (no
-// re-clearing security airside). Any other combination (train→flight,
-// flight→train, train→train) keeps the normal security buffer for the next
-// leg and fills only the time before it — the two blocks never overlap.
+// Pairs up consecutive flight/train legs close enough in time to be the same
+// journey. Flight→flight gets one "Connection" block, no per-leg security
+// buffer. Any other combo keeps the next leg's buffer and fills only the
+// time before it.
 function bcConnectionEvents_(evs) {
   const legs = evs.filter(e => !e.allDay && (e.cat === 'flight' || e.cat === 'train')).sort((a, b) => bcIsoToMs_(a.start) - bcIsoToMs_(b.start));
   const connections = [];
@@ -372,10 +350,8 @@ function bcConnectionEv_(a, b, start, end) {
   };
 }
 
-// tz: null means "floating" (no Z, no usable TZID) — genuinely ambiguous
-// per the ICS spec. Callers that know the leg's location (departure vs
-// arrival) can do a better job than blindly defaulting to BC.TIMEZONE, so
-// this returns null instead of guessing here.
+// tz: null means floating (no Z, no usable TZID) — the caller resolves it
+// from the leg's location instead of defaulting here.
 function bcIcsDate_(v, params) {
   if (/^\d{8}$/.test(v)) return { dt: v.slice(0,4)+'-'+v.slice(4,6)+'-'+v.slice(6,8)+'T00:00:00', tz: BC.TIMEZONE };
   const m = v.match(/^(\d{8}T\d{6})(Z)?$/); if (!m) return null;

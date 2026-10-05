@@ -5,12 +5,7 @@ function bcEventKey_(ev) {
 
 const bcLayerScore = { 'schema.org': 30, 'ics': 20 }; // anything else (AI) scores 10
 
-// Per-run cache of Calendar.Events.list results by day, shared by
-// bcAlreadyWellCovered_ and bcFindExisting_ — both query "what's on this
-// day" and a batch run often touches the same day more than once (several
-// emails about the same trip, or several unrelated bookings close together).
-// Invalidated on every write so a later lookup in the same run always sees
-// what was just created/updated.
+// Per-run cache of Calendar.Events.list by day; invalidated on every write.
 const bcDayEventsCache_ = {};
 function bcDayEvents_(date) {
   if (!(date in bcDayEventsCache_)) {
@@ -30,16 +25,8 @@ function bcDayEvents_(date) {
 }
 function bcInvalidateDay_(date) { delete bcDayEventsCache_[date]; }
 
-// Before spending an AI call on a message that has no schema.org/ICS data,
-// check whether a high-confidence event (schema.org or ICS tier) with a
-// clearly similar title already exists on the same day(s) — if so, this
-// email is very likely a weaker duplicate of something we already have
-// complete data for, so skip the AI extraction entirely instead of calling
-// it only to discard or append its result.
-//
-// The dates are found (via regex, no AI) in the email itself — if none are
-// found we have no safe way to scope the check, so it is skipped and the
-// AI call proceeds normally.
+// Skips an AI call when a high-confidence event with a similar title already
+// exists on a date found (via regex) in the email itself.
 function bcAlreadyWellCovered_(ctx) {
   const dates = bcExtractDates_(ctx.subject + ' ' + ctx.text);
   if (!dates.length) return false;
@@ -61,9 +48,7 @@ function bcSpanMin_(start, end) {
   return Math.round((b - a) / 60000);
 }
 
-// True when the calendar event's end came from a real arrival, not from
-// start + the category's default duration. The flag is set on write; if a
-// list response omits it, a duration other than the default still counts.
+// True when the event's end came from a real arrival, not a default-duration guess.
 function bcExistingEndReal_(event, cat) {
   const flag = event?.extendedProperties?.private?.resaEndReal;
   if (flag === '1') return true;
@@ -75,22 +60,14 @@ function bcExistingEndReal_(event, cat) {
 
 function bcEventQuality_(ev, layer) {
   let score = bcLayerScore[layer] || 10;
-  // A DTEND that was actually in the file beats a start-plus-default-duration
-  // guess. The guess used to score the same, so the mail that knew the
-  // arrival only appended a note and left the 3h block in place.
-  if (ev.end && !ev._endEstimated) score += 10;
+  if (ev.end && !ev._endEstimated) score += 10; // a real DTEND beats a duration guess
   if (!ev.needsReview) score += 3;
   score += (ev.details || []).filter(d => d[1]).length;
   return score;
 }
 
-// Wall-clock minutes, offset stripped. ICS datetimes are stored as local
-// time while Calendar returns an offset, so an instant comparison shifts
-// every event by the timezone and makes distinct legs look identical.
-// Wall time plus an IANA zone, as a UTC instant. A string that already
-// carries Z or an offset is used as-is. Apps Script has no zone parser,
-// so the offset is recovered by seeing how that zone would render the
-// same numbers if they were UTC.
+// Instant (ms since epoch) for a wall-clock time + IANA zone, since Apps
+// Script has no zone parser of its own.
 function bcInstantMs_(isoOrStart, tz) {
   let s = isoOrStart;
   let zone = tz || BC.TIMEZONE;
@@ -112,8 +89,7 @@ function bcSameInstant_(evMs, event) {
   return isFinite(evMs) && isFinite(startMs) && Math.abs(startMs - evMs) <= 5 * 60000;
 }
 
-// "London St Pancras Int'l" and "LONDON ST PANCRAS" are the same stop.
-// The shorter significant-word list has to be contained in the longer one.
+// True if the shorter stop name's words are all contained in the longer one.
 function bcStopIncludes_(hay, needle) {
   const words = s => bcNormalize_(s).replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2);
   const h = words(hay), n = words(needle);
@@ -123,9 +99,8 @@ function bcStopIncludes_(hay, needle) {
   return small.every(w => big.has(w));
 }
 
-// A previous run can leave a second copy at the same instant (a guessed
-// 2h block next to the real arrival, or a check-in stored in the other
-// timezone). Drop the extra script-owned copies and keep one.
+// Removes duplicate script-owned events at the same instant left by past
+// runs, keeping the one with the most accurate end time.
 function bcDropExtraTwins_(keep, ev) {
   if (!keep || !ev || !ev.start) return;
   const evMs = bcInstantMs_(ev.start, ev.tzStart);
@@ -144,8 +119,6 @@ function bcDropExtraTwins_(keep, ev) {
       group.push(e);
     });
   });
-  // Keep the copy whose end is a real arrival. Two guesses: keep the
-  // shorter one, which is the stated trip rather than start + 2h.
   group.sort((a, b) => {
     const ar = bcExistingEndReal_(a, ev.cat) ? 1 : 0;
     const br = bcExistingEndReal_(b, ev.cat) ? 1 : 0;
@@ -181,18 +154,13 @@ function bcFindExisting_(key, ev) {
   const byKey = hits.find(e => e.extendedProperties?.private?.resaKey === key);
   if (byKey) return { event: byKey, exact: true, quality: quality(byKey) };
   const evMs = bcInstantMs_(ev.start, ev.tzStart);
-  // A check-in only matches another check-in at the same instant. Matching
-  // it to the train (same station) would swallow the blocker.
   if (ev._isPreDeparture) {
     const twin = hits.find(e => bcSameInstant_(evMs, e) && e.summary && bcTitleSimilar_(e.summary, ev.title));
     return twin ? { event: twin, exact: true, quality: quality(twin) } : null;
   }
 
   const locSlug = ev.location ? bcNormalize_(ev.location.split(',')[0]).slice(0, 20) : '';
-  // Same booking described twice shares a departure instant, give or take
-  // a couple of minutes. Compare instants, not wall clocks: 18:04 in London
-  // and 19:04 in Paris are the same train. A leg that really leaves 20 min
-  // later stays outside the window.
+  // Instant match (not wall clock): 18:04 London and 19:04 Paris can be the same train.
   const found = hits.find(e => {
     if (!bcSameInstant_(evMs, e)) return false;
     const locMatch = !!(locSlug && e.location && bcStopIncludes_(e.location, locSlug));
@@ -250,11 +218,8 @@ function bcEventTimeFields_(ev) {
   };
 }
 
-// Labels live on the calendar (labelProperties.eventLabels). An event only
-// stores the label's id, and the API ignores eventLabelId unless the request
-// carries eventLabelVersion=1. The Apps Script client does not send that
-// parameter, so this is a direct Calendar API call. Nothing is created:
-// the name has to match a label that already exists.
+// Calendar labels are a separate API call: the Apps Script client doesn't
+// support eventLabelVersion=1, so this talks to the REST API directly.
 var bcResolvedLabelId_;
 function bcCalendarApi_(method, path, body) {
   const opts = {
@@ -300,10 +265,7 @@ function bcApplyLabel_(eventId) {
   } catch (e) { bcTrace_('  LABEL failed: ' + e); }
 }
 
-// A later email about the same booking that's a strictly better source
-// (higher-confidence layer and/or more complete data) replaces the dates,
-// title, location and description instead of just appending to them —
-// this is what fixes a bad guess from a weak source once a better one shows up.
+// A strictly better source replaces dates/title/location/description outright.
 function bcUpgradeEvent_(existing, ev, ctx, files, layer, quality) {
   const atts = files.filter(f => !ev.attachmentFilter || ev.attachmentFilter.test(f.name));
   const time = bcEventTimeFields_(ev);
@@ -323,10 +285,8 @@ function bcUpgradeEvent_(existing, ev, ctx, files, layer, quality) {
   } catch (e) { bcTrace_('  WRITE failed: ' + e); }
 }
 
-// Appends a full extra source block (same details/email/tickets/reference/
-// source structure as the primary description) rather than trying to merge
-// new lines into the existing text — simpler and keeps each source legible
-// on its own instead of an ad-hoc diff of what's "new".
+// Appends a full extra source block, separated by "------", rather than
+// diffing into the existing text.
 function bcEnrichEvent_(existing, ev, ctx, files, layer) {
   const currentDesc = existing.description || '';
   const threadUrl = bcThreadUrl_(ctx);
@@ -343,9 +303,8 @@ function bcEnrichEvent_(existing, ev, ctx, files, layer) {
   } catch (e) { bcTrace_('  WRITE failed: ' + e); }
 }
 
-// "STATION_A_STATION_B_2026-10-06_LASTNAME_FIRSTNAME_REF.pdf" → the leg
-// already created from the ICS. Stations are separated by one underscore;
-// the date anchors the cut so the passenger name after it is ignored.
+// "STATION_A_STATION_B_2026-10-06_LASTNAME_FIRSTNAME_REF.pdf" → matches the
+// leg already created from the ICS.
 function bcRouteFromPdfName_(name) {
   const base = String(name || '').replace(/\.pdf$/i, '');
   const dm = base.match(/_(\d{4}-\d{2}-\d{2})(?:_|$)/);
@@ -366,8 +325,7 @@ function bcFindTicketEvent_(route) {
   });
 }
 
-// True when every PDF on the mail was filed onto the matching event.
-// Called after the ICS pass, so the leg already exists and no AI call is needed.
+// Matches loose PDF attachments to an already-created event by filename, no AI needed.
 function bcAttachTicketPdfs_(ctx, simulate) {
   const pdfs = bcUsefulAttachments_(ctx).filter(a => /\.pdf$/i.test(a.getName() || ''));
   if (!pdfs.length) return false;
@@ -475,9 +433,7 @@ function bcSaveAttachments_(ctx, ev) {
     return { name, url: f.getUrl(), mime: a.getContentType() };
   });
   if (!saved.length) {
-    // Ticket URLs can come from structured data (e.g. schema.org's
-    // ticketDownloadUrl) without appearing as a clickable link in the
-    // email's HTML body — check ev.links first, not just the scraped ones.
+    // Ticket URLs can live in structured data (schema.org) without a visible link.
     const seenUrls = new Set();
     const ticketLinks = [
       ...(ev.links || []).filter(l => l[1] && /ticket/i.test(l[0])).map(l => ({ url: l[1], text: l[0] })),
@@ -485,16 +441,14 @@ function bcSaveAttachments_(ctx, ev) {
     ]
       .filter(x => !seenUrls.has(x.url) && seenUrls.add(x.url))
       // Fetches to this domain never return from Apps Script — skip it so
-      // one slow link can't stall the whole batch. Link stays in the
-      // description for manual use.
+      // one slow link can't stall the whole batch.
       .filter(x => !/fnacspectacles\.com/i.test(x.url));
     ticketLinks.forEach((lk, i) => {
       try {
         let resp = UrlFetchApp.fetch(lk.url, { muteHttpExceptions: true, followRedirects: true });
         if (resp.getResponseCode() !== 200) return;
         let mime = resp.getHeaders()['Content-Type'] || '';
-        // Intermediate HTML download page (e.g. "téléchargement commence dans 3s"):
-        // extract the direct PDF link from meta-refresh or the fallback "cliquez ici" anchor
+        // Intermediate "téléchargement dans 3s" page: extract the real link
         if (/html/i.test(mime)) {
           const html2 = resp.getContentText();
           const metaRefresh = (html2.match(/meta[^>]+http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url=([^"']+)/i) || [])[1];

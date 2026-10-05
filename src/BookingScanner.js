@@ -73,10 +73,8 @@ function processThread(threadId, simulate) {
   }
 }
 
-// Schema.org/ICS run for the whole batch first; AI extraction (the expensive,
-// order-sensitive layer) runs last, once every fast-layer event already
-// exists in Calendar — so quality comparisons see the full picture instead
-// of whatever happened to be processed first.
+// Schema.org/ICS run for the whole batch first; AI extraction runs last,
+// once every fast-layer event already exists in Calendar.
 function bcRunBatch_(q, simulate) {
   const tally = bcTally_();
   const deferred = [];
@@ -94,8 +92,7 @@ function bcTallyStr_(t, prefix) {
 
 /* ===================== MAIN PIPELINE ===================== */
 
-// deferred, when passed, collects messages needing AI extraction instead of
-// calling it immediately — see bcRunBatch_.
+// deferred, when passed, collects messages needing AI extraction — see bcRunBatch_.
 function bcProcessMsg_(msg, simulate, tally, deferred) {
   if (!tally) tally = bcTally_();
   const ctx = bcBuildCtx_(msg);
@@ -155,16 +152,13 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
 
   evs.forEach(ev => {
     ev._key = bcEventKey_(ev);
-    // Start minute + title, not day + place. Several ICS legs often share a
-    // day and an airport; collapsing on location kept only the first title.
+    // Start minute + title, not day + place: several ICS legs often share a day and an airport.
     const seenKey = bcInstantMs_(ev.start, ev.tzStart) + '|' + bcNormalize_(ev.title).replace(/\s*\([^)]*\)?\s*$/g, '').trim().slice(0, 60);
     const duplicate = tally.seen.includes(ev._key) || tally.seen.includes(seenKey);
     const match = bcFindExisting_(ev._key, ev);
     const incomingReal = !!(ev.end && !ev._endEstimated);
-    // Same route already handled in this run. Still let a real arrival
-    // through when the calendar copy is only start + default duration: one
-    // source's file (no DTEND) may be processed before another's that
-    // states the actual arrival time, and both share the same leg title.
+    // Still let a real arrival through a duplicate-in-this-run skip when the
+    // calendar copy is only a default-duration guess.
     if (duplicate && (!incomingReal || (match && bcExistingEndReal_(match.event, ev.cat)))) {
       if (match) {
         bcDropExtraTwins_(match.event, ev);
@@ -179,8 +173,7 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
       const existingReal = bcExistingEndReal_(match.event, ev.cat);
       const incomingEnd = incomingReal ? bcInstantMs_(ev.end, ev.tzEnd || ev.tzStart) : NaN;
       const existingEnd = bcInstantMs_(match.event.end, match.event.end?.timeZone);
-      // 08:57 stored as Paris is an hour earlier than 08:57 London. A source
-      // of equal quality may extend that arrival; it may not shrink a real one.
+      // An equal-quality source may extend a real arrival but not shrink it.
       const endMoved = isFinite(incomingEnd) && isFinite(existingEnd) && incomingEnd - existingEnd > 5 * 60000;
       const canReplace = incomingReal || !existingReal;
       if ((incomingReal && !existingReal) || (endMoved && incomingReal && quality >= match.quality) || (quality > match.quality && canReplace)) {
@@ -212,17 +205,13 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
 
 /* ===================== LAYER 0 — ELIGIBILITY ===================== */
 
-// Google Calendar already adds the event when someone invites you. The
-// notification mail carries invite.ics (or comes from calendar-notification),
-// and treating that file as a booking creates a second copy.
+// Google Calendar already adds this event itself — don't create a second copy.
 function bcIsGoogleCalendarInvite_(ctx) {
   if (/calendar-notification@google\.com/i.test(ctx.from || '')) return true;
   return (ctx.attachments || []).some(att => /^invite\.ics$/i.test(att.getName() || ''));
 }
 
-// Zoom, Teams, Webex and the other meeting products. A ticket that only
-// mentions a stream in the subject is kept; a mail that is itself the
-// join invitation, or whose only calendar file is one, is not.
+// A mail that's itself a video-meeting join invitation, not a ticket that merely mentions one.
 function bcIsVideoConferenceInvite_(ctx) {
   const from = ctx.from || '';
   if (bcVideoSenders.test(from) || bcVideoSenders.test(bcReconstructDomain_(from))) return true;

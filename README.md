@@ -66,7 +66,11 @@ Three-layer detection pipeline, tried in order per message:
 | **2** | ICS attachment(s), `.ics` URL, or Google Calendar add-link — extracts every event from every attachment | medium |
 | **3** | AI extraction from body + PDF attachments (Claude or Gemini) | medium |
 
-A batch run (`runBookingScanner()` / the scheduled trigger) always finishes layers 0–2 for every message first, and only runs AI extraction afterwards for whatever's left — so later, more complete emails in the same batch are already on the calendar by the time any AI call happens. Before spending an AI call at all, the scanner also checks whether a high-confidence event with a clearly similar title already exists on the dates mentioned in the email (found via regex, no AI needed) — if so, the call is skipped as a likely weaker duplicate.
+A batch run (`runBookingScanner()` / the scheduled trigger) always finishes layers 0–2 for every message first, and only runs AI extraction afterwards for whatever's left — so later, more complete emails in the same batch are already on the calendar by the time any AI call happens. Before spending an AI call at all, the scanner also checks:
+- whether a high-confidence event with a clearly similar title already exists on the dates mentioned in the email (found via regex, no AI needed) — skips the call as a likely weaker duplicate;
+- whether a loose PDF attachment's filename (e.g. a rail ticket named `STATION_A_STATION_B_2026-10-06_...`) matches a leg already created by the ICS layer — if so, the PDF is just filed onto that event instead of triggering AI extraction.
+
+Emails that are Google Calendar invite notifications, or are themselves a Zoom/Teams/Webex/etc. join invitation, are excluded before any detection layer runs.
 
 **Active categories** (`bcActiveCategories` in `src/BookingDetectionRules.js`):
 
@@ -85,11 +89,15 @@ A batch run (`runBookingScanner()` / the scheduled trigger) always finishes laye
 
 **Multi-booking emails**: a single email with multiple ICS files or schema.org blocks (e.g. a travel agent recap with outbound + return flights + hotel) creates one event per booking.
 
-**Duplicate handling**: if a later email covers a booking that already has a calendar event (same date and a matching location or a clearly similar title), it's merged rather than duplicated. Each source is scored by layer confidence (schema.org > ICS > AI) plus data completeness, and that score is stored on the event. A better-scoring email replaces the dates/title/location/description outright — this is what fixes a wrong or incomplete guess once a more complete source is found. A weaker or equal source gets appended as its own clearly separated block instead. This works regardless of which email is processed first.
+**Duplicate handling**: if a later email covers a booking that already has a calendar event (same real-world instant — timezone-aware, so a leg logged in its departure zone and one logged in its arrival zone still match — and a matching location or a clearly similar title), it's merged rather than duplicated. Each source is scored by layer confidence (schema.org > ICS > AI) plus data completeness, and that score is stored on the event. A better-scoring email, or simply one with a real arrival time where the calendar only had a default-duration guess, replaces the dates/title/location/description outright. A weaker or equal source gets appended as its own clearly separated block instead. Leftover duplicate events from past runs (e.g. a guessed block next to the real one) are detected and cleaned up automatically. This works regardless of which email is processed first.
+
+**Calendar labels**: set `BC_LABEL` in `Config.js` to the name of an existing calendar label (Calendar's own label feature, not a Gmail label) to have every created/matched event tagged with it automatically.
 
 **Subject matching** covers French, English, Spanish, Portuguese, Italian, Polish, Japanese, Chinese, Korean, German, and Scandinavian keywords (`bcSubjects` in `src/BookingDetectionRules.js`); exclusion rules (newsletters, promotions, pre-sale announcements, etc.) cover the same set of languages.
 
 **Idempotency**: handled by `_ckd` — threads already labeled `_ckd` are excluded from the search query. To reprocess a thread, remove its `_ckd` label in Gmail, or call `processThread(threadId, simulate)` directly (bypasses `_ckd` entirely).
+
+**Debugging a specific email**: `runBookingScanner()` and `processThread()` both turn on verbose tracing for the duration of the call (off during the scheduled trigger) — the execution log shows each message's eligibility, which layer matched, the raw source data behind every date/timezone decision, and whether an event was created/upgraded/enriched/skipped and why.
 
 Layer 3 requires `AI_API_KEY` in Script Properties, with `AI_MODEL` picking the provider (any Claude or Gemini model). If `AI_API_KEY` is empty, AI extraction is silently skipped — layers 1–2 still work.
 
@@ -165,7 +173,7 @@ clasp pull          # pull current GAS state back to disk
 clasp logs          # stream execution logs
 ```
 
-A git commit + `clasp push` runs automatically on every Claude Code session stop (see `.claude/settings.json`). The deployment is `@HEAD` so every push is live immediately — no separate deploy step.
+The deployment is `@HEAD`, so every `clasp push` is live immediately — no separate deploy step. A Claude Code hook can automate commit + push on every session stop; see `.claude/settings.json` (gitignored, local-only — not included in this repo since it holds a machine-specific path).
 
 **Quick rollback**:
 ```bash
