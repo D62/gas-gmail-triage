@@ -14,7 +14,17 @@ const bcLayerScore = { 'schema.org': 30, 'ics': 20 }; // anything else (AI) scor
 const bcDayEventsCache_ = {};
 function bcDayEvents_(date) {
   if (!(date in bcDayEventsCache_)) {
-    bcDayEventsCache_[date] = (Calendar.Events.list(BC.CALENDAR_ID, { timeMin: date + 'T00:00:00Z', timeMax: date + 'T23:59:59Z', maxResults: 50, showDeleted: false }).items || []);
+    const items = [];
+    let pageToken;
+    do {
+      const res = Calendar.Events.list(BC.CALENDAR_ID, {
+        timeMin: date + 'T00:00:00Z', timeMax: date + 'T23:59:59Z',
+        maxResults: 250, showDeleted: false, singleEvents: true, orderBy: 'startTime', pageToken,
+      });
+      items.push.apply(items, res.items || []);
+      pageToken = res.nextPageToken;
+    } while (pageToken && items.length < 1000);
+    bcDayEventsCache_[date] = items;
   }
   return bcDayEventsCache_[date];
 }
@@ -44,12 +54,124 @@ function bcAlreadyWellCovered_(ctx) {
   return false;
 }
 
+function bcSpanMin_(start, end) {
+  const a = bcInstantMs_(start, start && start.timeZone);
+  const b = bcInstantMs_(end, end && end.timeZone);
+  if (!isFinite(a) || !isFinite(b)) return NaN;
+  return Math.round((b - a) / 60000);
+}
+
+// True when the calendar event's end came from a real arrival, not from
+// start + the category's default duration. The flag is set on write; if a
+// list response omits it, a duration other than the default still counts.
+function bcExistingEndReal_(event, cat) {
+  const flag = event?.extendedProperties?.private?.resaEndReal;
+  if (flag === '1') return true;
+  if (flag === '0') return false;
+  const mins = bcSpanMin_(event.start, event.end);
+  const def = bcDefaultDuration[cat] || 120;
+  return isFinite(mins) && mins !== def;
+}
+
 function bcEventQuality_(ev, layer) {
   let score = bcLayerScore[layer] || 10;
-  if (ev.end) score += 5;
+  // A DTEND that was actually in the file beats a start-plus-default-duration
+  // guess. The guess used to score the same, so the mail that knew the
+  // arrival only appended a note and left the 3h block in place.
+  if (ev.end && !ev._endEstimated) score += 10;
   if (!ev.needsReview) score += 3;
   score += (ev.details || []).filter(d => d[1]).length;
   return score;
+}
+
+// Wall-clock minutes, offset stripped. ICS datetimes are stored as local
+// time while Calendar returns an offset, so an instant comparison shifts
+// every event by the timezone and makes distinct legs look identical.
+// Wall time plus an IANA zone, as a UTC instant. A string that already
+// carries Z or an offset is used as-is. Apps Script has no zone parser,
+// so the offset is recovered by seeing how that zone would render the
+// same numbers if they were UTC.
+function bcInstantMs_(isoOrStart, tz) {
+  let s = isoOrStart;
+  let zone = tz || BC.TIMEZONE;
+  if (s && typeof s === 'object') {
+    zone = s.timeZone || zone;
+    s = s.dateTime || (s.date ? s.date + 'T00:00:00' : '');
+  }
+  s = String(s || '');
+  if (!s) return NaN;
+  if (/Z|[+-]\d{2}:\d{2}$/.test(s)) return new Date(s).getTime();
+  const asUtc = new Date(s.slice(0, 19) + 'Z');
+  if (isNaN(asUtc.getTime())) return NaN;
+  const shown = Utilities.formatDate(asUtc, zone, "yyyy-MM-dd'T'HH:mm:ss");
+  return asUtc.getTime() - (new Date(shown + 'Z').getTime() - asUtc.getTime());
+}
+
+function bcSameInstant_(evMs, event) {
+  const startMs = bcInstantMs_(event.start, event.start?.timeZone);
+  return isFinite(evMs) && isFinite(startMs) && Math.abs(startMs - evMs) <= 5 * 60000;
+}
+
+// "London St Pancras Int'l" and "LONDON ST PANCRAS" are the same stop.
+// The shorter significant-word list has to be contained in the longer one.
+function bcStopIncludes_(hay, needle) {
+  const words = s => bcNormalize_(s).replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2);
+  const h = words(hay), n = words(needle);
+  if (!h.length || !n.length) return false;
+  const small = h.length <= n.length ? h : n;
+  const big = new Set(small === h ? n : h);
+  return small.every(w => big.has(w));
+}
+
+// A previous run can leave a second copy at the same instant (a guessed
+// 2h block next to the real arrival, or a check-in stored in the other
+// timezone). Drop the extra script-owned copies and keep one.
+function bcDropExtraTwins_(keep, ev) {
+  if (!keep || !ev || !ev.start) return;
+  const evMs = bcInstantMs_(ev.start, ev.tzStart);
+  const days = [String(ev.start).slice(0, 10)];
+  const keepDay = (keep.start?.dateTime || keep.start?.date || '').slice(0, 10);
+  if (keepDay && days.indexOf(keepDay) < 0) days.push(keepDay);
+  const group = [keep];
+  days.forEach(day => {
+    bcDayEvents_(day).forEach(e => {
+      if (!e.id) return;
+      if (e.id === keep.id) { group[0] = e; return; }
+      if (group.some(g => g.id === e.id)) return;
+      if (!e.extendedProperties?.private?.resaKey) return;
+      if (!bcSameInstant_(evMs, e)) return;
+      if (!e.summary || !bcTitleSimilar_(e.summary, ev.title)) return;
+      group.push(e);
+    });
+  });
+  // Keep the copy whose end is a real arrival. Two guesses: keep the
+  // shorter one, which is the stated trip rather than start + 2h.
+  group.sort((a, b) => {
+    const ar = bcExistingEndReal_(a, ev.cat) ? 1 : 0;
+    const br = bcExistingEndReal_(b, ev.cat) ? 1 : 0;
+    if (ar !== br) return br - ar;
+    const ad = bcSpanMin_(a.start, a.end), bd = bcSpanMin_(b.start, b.end);
+    if (ad !== bd) return ad - bd;
+    if (a.id === keep.id) return -1;
+    if (b.id === keep.id) return 1;
+    return 0;
+  });
+  group.slice(1).forEach(e => {
+    try {
+      Calendar.Events.remove(BC.CALENDAR_ID, e.id);
+      bcTrace_('  DROP twin "' + (e.summary || '') + '"');
+    } catch (err) { bcTrace_('  DROP failed: ' + err); }
+  });
+  days.forEach(bcInvalidateDay_);
+}
+
+function bcWallStartMs_(isoOrStart) {
+  let s = isoOrStart;
+  if (s && typeof s === 'object') s = s.dateTime || (s.date ? s.date + 'T00:00:00' : '');
+  s = String(s || '').replace(/Z|[+-]\d{2}:\d{2}$/, '');
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?/);
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0));
 }
 
 function bcFindExisting_(key, ev) {
@@ -58,12 +180,25 @@ function bcFindExisting_(key, ev) {
   const hits = bcDayEvents_(ev.start.slice(0, 10));
   const byKey = hits.find(e => e.extendedProperties?.private?.resaKey === key);
   if (byKey) return { event: byKey, exact: true, quality: quality(byKey) };
-  if (!ev.location) return null;
-  const locSlug = bcNormalize_(ev.location.split(',')[0]).slice(0, 20);
-  // Same day + (location prefix matches OR titles are clearly the same event
-  // worded differently) — covers sources that describe the location in
-  // incompatible ways (e.g. a venue's full name vs just the room name).
-  const found = hits.find(e => (e.location && bcNormalize_(e.location).includes(locSlug)) || (e.summary && bcTitleSimilar_(e.summary, ev.title)));
+  const evMs = bcInstantMs_(ev.start, ev.tzStart);
+  // A check-in only matches another check-in at the same instant. Matching
+  // it to the train (same station) would swallow the blocker.
+  if (ev._isPreDeparture) {
+    const twin = hits.find(e => bcSameInstant_(evMs, e) && e.summary && bcTitleSimilar_(e.summary, ev.title));
+    return twin ? { event: twin, exact: true, quality: quality(twin) } : null;
+  }
+
+  const locSlug = ev.location ? bcNormalize_(ev.location.split(',')[0]).slice(0, 20) : '';
+  // Same booking described twice shares a departure instant, give or take
+  // a couple of minutes. Compare instants, not wall clocks: 18:04 in London
+  // and 19:04 in Paris are the same train. A leg that really leaves 20 min
+  // later stays outside the window.
+  const found = hits.find(e => {
+    if (!bcSameInstant_(evMs, e)) return false;
+    const locMatch = !!(locSlug && e.location && bcStopIncludes_(e.location, locSlug));
+    const titleMatch = !!(e.summary && bcTitleSimilar_(e.summary, ev.title));
+    return locMatch || titleMatch;
+  });
   return found ? { event: found, exact: false, quality: quality(found) } : null;
 }
 
@@ -93,8 +228,8 @@ function bcBuildDescription_(ev, ctx, atts, layer) {
 
 function bcEventTimeFields_(ev) {
   const hasOffset = s => /[+-]\d{2}:\d{2}$|Z$/.test(s || '');
-  const durMs = (bcDefaultDuration[ev.cat] || 120) * 60000;
-  const endDt = ev.end || new Date(new Date(ev.start).getTime() + durMs).toISOString();
+  const endDt = ev.end || bcPlusMin_(ev.start, bcDefaultDuration[ev.cat] || 120);
+  const endTz = ev._endEstimated ? (ev.tzStart || BC.TIMEZONE) : (ev.tzEnd || ev.tzStart || BC.TIMEZONE);
   if (ev.allDay) {
     // Calendar API end is exclusive: +1 day so checkout day shows on calendar
     const endBase = (ev.end || ev.start).slice(0, 10);
@@ -106,13 +241,63 @@ function bcEventTimeFields_(ev) {
   if (hasOffset(ev.start)) {
     return {
       start: { dateTime: ev.start },
-      end: { dateTime: hasOffset(endDt) ? endDt : new Date(new Date(ev.start).getTime() + durMs).toISOString() },
+      end: { dateTime: hasOffset(endDt) ? endDt : bcPlusMin_(ev.start, bcDefaultDuration[ev.cat] || 120) },
     };
   }
   return {
     start: { dateTime: ev.start, timeZone: ev.tzStart || BC.TIMEZONE },
-    end: { dateTime: endDt, timeZone: ev.tzEnd || ev.tzStart || BC.TIMEZONE },
+    end: { dateTime: endDt, timeZone: endTz },
   };
+}
+
+// Labels live on the calendar (labelProperties.eventLabels). An event only
+// stores the label's id, and the API ignores eventLabelId unless the request
+// carries eventLabelVersion=1. The Apps Script client does not send that
+// parameter, so this is a direct Calendar API call. Nothing is created:
+// the name has to match a label that already exists.
+var bcResolvedLabelId_;
+function bcCalendarApi_(method, path, body) {
+  const opts = {
+    method,
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true,
+  };
+  if (body != null) {
+    opts.contentType = 'application/json';
+    opts.payload = JSON.stringify(body);
+  }
+  const res = UrlFetchApp.fetch('https://www.googleapis.com/calendar/v3' + path, opts);
+  const code = res.getResponseCode();
+  const text = res.getContentText() || '';
+  if (code >= 300) throw new Error(method + ' ' + path + ' ' + code + ': ' + text.slice(0, 240));
+  return text ? JSON.parse(text) : {};
+}
+
+function bcLabelId_() {
+  if (bcResolvedLabelId_ !== undefined) return bcResolvedLabelId_;
+  const name = typeof BC_LABEL === 'string' ? BC_LABEL : (BC_LABEL && BC_LABEL.name);
+  if (!name) { bcResolvedLabelId_ = ''; return ''; }
+  try {
+    const cal = bcCalendarApi_('get', '/calendars/' + encodeURIComponent(BC.CALENDAR_ID));
+    const labels = (cal.labelProperties && cal.labelProperties.eventLabels) || [];
+    const found = labels.find(l => bcNormalize_(l.name || '') === bcNormalize_(name));
+    bcTrace_('  LABEL lookup "' + name + '" among ' + (labels.map(l => l.name).join(', ') || 'none'));
+    if (!found) { bcResolvedLabelId_ = ''; return ''; }
+    bcResolvedLabelId_ = found.id;
+    return found.id;
+  } catch (e) {
+    bcTrace_('  LABEL failed: ' + e);
+    bcResolvedLabelId_ = '';
+    return '';
+  }
+}
+
+function bcApplyLabel_(eventId) {
+  const labelId = bcLabelId_();
+  if (!labelId || !eventId) return;
+  try {
+    bcCalendarApi_('patch', '/calendars/' + encodeURIComponent(BC.CALENDAR_ID) + '/events/' + encodeURIComponent(eventId) + '?eventLabelVersion=1', { eventLabelId: labelId });
+  } catch (e) { bcTrace_('  LABEL failed: ' + e); }
 }
 
 // A later email about the same booking that's a strictly better source
@@ -127,14 +312,15 @@ function bcUpgradeEvent_(existing, ev, ctx, files, layer, quality) {
     location: ev.location || '',
     description: bcBuildDescription_(ev, ctx, atts, layer),
     start: time.start, end: time.end,
-    extendedProperties: { private: { resaKey: existing.extendedProperties?.private?.resaKey || ev._key, resaRef: ev.ref || '', resaQuality: String(quality) } },
+    extendedProperties: { private: { resaKey: existing.extendedProperties?.private?.resaKey || ev._key, resaRef: ev.ref || '', resaQuality: String(quality), resaEndReal: ev._endEstimated ? '0' : '1' } },
   };
   if (atts.length) patch.attachments = [...(existing.attachments || []), ...atts.map(bcAttResource_)];
   try {
     Calendar.Events.patch(patch, BC.CALENDAR_ID, existing.id, { supportsAttachments: true });
+    bcApplyLabel_(existing.id);
     bcInvalidateDay_((existing.start?.date || existing.start?.dateTime || '').slice(0, 10));
     bcInvalidateDay_(ev.start.slice(0, 10));
-  } catch(e) {}
+  } catch (e) { bcTrace_('  WRITE failed: ' + e); }
 }
 
 // Appends a full extra source block (same details/email/tickets/reference/
@@ -144,11 +330,75 @@ function bcUpgradeEvent_(existing, ev, ctx, files, layer, quality) {
 function bcEnrichEvent_(existing, ev, ctx, files, layer) {
   const currentDesc = existing.description || '';
   const threadUrl = bcThreadUrl_(ctx);
-  if (currentDesc.includes(threadUrl)) return;
   const atts = files.filter(f => !ev.attachmentFilter || ev.attachmentFilter.test(f.name));
-  const patch = { description: currentDesc + '\n\n------\n\n' + bcBuildDescription_(ev, ctx, atts, layer) };
-  if (atts.length) patch.attachments = [...(existing.attachments || []), ...atts.map(bcAttResource_)];
-  try { Calendar.Events.patch(patch, BC.CALENDAR_ID, existing.id, { supportsAttachments: true }); } catch(e) {}
+  const have = new Set((existing.attachments || []).map(a => a.title));
+  const fresh = atts.filter(a => !have.has(a.name));
+  if (currentDesc.includes(threadUrl) && !fresh.length) return;
+  const patch = {};
+  if (!currentDesc.includes(threadUrl)) patch.description = currentDesc + '\n\n------\n\n' + bcBuildDescription_(ev, ctx, atts, layer);
+  if (fresh.length) patch.attachments = [...(existing.attachments || []), ...fresh.map(bcAttResource_)];
+  try {
+    Calendar.Events.patch(patch, BC.CALENDAR_ID, existing.id, { supportsAttachments: true });
+    bcApplyLabel_(existing.id);
+  } catch (e) { bcTrace_('  WRITE failed: ' + e); }
+}
+
+// "STATION_A_STATION_B_2026-10-06_LASTNAME_FIRSTNAME_REF.pdf" → the leg
+// already created from the ICS. Stations are separated by one underscore;
+// the date anchors the cut so the passenger name after it is ignored.
+function bcRouteFromPdfName_(name) {
+  const base = String(name || '').replace(/\.pdf$/i, '');
+  const dm = base.match(/_(\d{4}-\d{2}-\d{2})(?:_|$)/);
+  if (!dm) return null;
+  const parts = base.slice(0, dm.index).split('_').map(s => s.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  return { dep: parts[0], arr: parts.slice(1).join(' '), date: dm[1] };
+}
+
+function bcFindTicketEvent_(route) {
+  const dep = bcNormalize_(route.dep), arr = bcNormalize_(route.arr);
+  return bcDayEvents_(route.date).find(e => {
+    if (!e.summary || !e.extendedProperties?.private?.resaKey) return false;
+    const title = bcNormalize_(e.summary);
+    const depAt = title.indexOf(dep), arrAt = title.indexOf(arr);
+    if (depAt < 0 || arrAt < 0 || depAt >= arrAt) return false;
+    return !e.location || bcStopIncludes_(e.location, route.dep);
+  });
+}
+
+// True when every PDF on the mail was filed onto the matching event.
+// Called after the ICS pass, so the leg already exists and no AI call is needed.
+function bcAttachTicketPdfs_(ctx, simulate) {
+  const pdfs = bcUsefulAttachments_(ctx).filter(a => /\.pdf$/i.test(a.getName() || ''));
+  if (!pdfs.length) return false;
+  let matched = 0;
+  pdfs.forEach(att => {
+    const route = bcRouteFromPdfName_(att.getName());
+    const event = route && bcFindTicketEvent_(route);
+    if (!event) { bcTrace_('  PDF no match "' + att.getName() + '"'); return; }
+    matched++;
+    bcTrace_('  ATTACH "' + att.getName() + '" → "' + (event.summary || '') + '"');
+    if (simulate) return;
+    const saved = bcSaveAttachments_(
+      Object.assign({}, ctx, { attachments: [att], links: [] }),
+      { title: event.summary, start: (event.start?.dateTime || event.start?.date || route.date).slice(0, 19) }
+    );
+    const have = new Set((event.attachments || []).map(a => a.title));
+    const fresh = saved.filter(f => !have.has(f.name));
+    const threadUrl = bcThreadUrl_(ctx);
+    const desc = event.description || '';
+    const patch = {};
+    if (fresh.length) patch.attachments = [...(event.attachments || []), ...fresh.map(bcAttResource_)];
+    if (threadUrl && !desc.includes(threadUrl)) {
+      patch.description = desc + (desc ? '\n\n------\n\n' : '') + ['📧 ' + bcDescLabels.email + ': ' + threadUrl, ...fresh.map(f => '🎫 ' + f.name + ': ' + f.url)].join('\n');
+    }
+    if (!patch.attachments && !patch.description) return;
+    try {
+      Calendar.Events.patch(patch, BC.CALENDAR_ID, event.id, { supportsAttachments: true });
+      bcInvalidateDay_(route.date);
+    } catch (e) { bcTrace_('  WRITE failed: ' + e); }
+  });
+  return matched > 0 && matched === pdfs.length;
 }
 
 function bcCreateEvent_(ev, ctx, files, layer) {
@@ -158,7 +408,7 @@ function bcCreateEvent_(ev, ctx, files, layer) {
     summary: (ev.needsReview ? '[To review] ' : '') + ev.title, location: ev.location || '',
     description: bcBuildDescription_(ev, ctx, atts, layer),
     reminders: { useDefault: false, overrides: (bcReminders[ev.cat] || [1440]).map(m => ({ method: 'popup', minutes: m })) },
-    extendedProperties: { private: { resaKey: ev._key, resaRef: ev.ref || '', resaQuality: String(bcEventQuality_(ev, layer)) } },
+    extendedProperties: { private: { resaKey: ev._key, resaRef: ev.ref || '', resaQuality: String(bcEventQuality_(ev, layer)), resaEndReal: ev._endEstimated ? '0' : '1' } },
     source: { title: 'Confirmation email', url: bcThreadUrl_(ctx) },
     start: time.start, end: time.end,
   };
@@ -167,8 +417,9 @@ function bcCreateEvent_(ev, ctx, files, layer) {
     try {
       const created = Calendar.Events.insert(patch(resource), BC.CALENDAR_ID, { supportsAttachments: true });
       bcInvalidateDay_(ev.start.slice(0, 10));
+      bcApplyLabel_(created.id);
       return created;
-    } catch (e) {}
+    } catch (e) { bcTrace_('  WRITE failed: ' + e); }
   }
 }
 

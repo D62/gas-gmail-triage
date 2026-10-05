@@ -70,6 +70,11 @@ const bcMedicalSenders = /doctolib|captainvet|vetup|vetolog/i;
 const bcPersonalApptSenders = /square\.|squareup\.com/i;
 const bcCalComSenders = /\bcal\.com\b|calendly\.com|acuityscheduling/i;
 
+// Videoconference products. A mail from one of these, or whose opening
+// (or sole .ics) is a join link, is a meeting invite — not a booking.
+const bcVideoSenders = /zoom\.(?:us|com)|teams\.microsoft\.com|email\.teams\.microsoft|webex\.com|gotomeeting\.com|\bgoto\.com|bluejeans\.com|whereby\.com|meet\.google\.com|chime\.aws|ringcentral\.com|dialpad\.com|livestorm\.|demio\.com|hopin\.com|skype\.com|meeting\.zoho\.com|around\.co|meet\.jit\.si/i;
+const bcVideoInvite = /join zoom meeting|zoom meeting invitation|invited to a zoom|invitation[^.\n]{0,40}zoom meeting|r[ée]union\s+(?:zoom|teams|webex)|microsoft teams meeting|teams\.microsoft\.com\/l\/meetup-join|teams\.live\.com\/meet|zoom\.us\/(?:j|w)\//i;
+
 const bcExclSubjects = [
   // Day-before departure/trip reminders (French-specific wording)
   /J-1\b|d[ée]part imminent/i,

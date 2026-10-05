@@ -97,6 +97,7 @@ function bcSchemaFlight_(obj, domain) {
     location: depCity + (depCode ? ' (' + depCode + ')' : ''),
     details: [['Flight', flight + (airline ? ' (' + airline + ')' : '')], ['Departure', depCity], ['Arrival', arrCity], ['Passenger', bcSchemaGet_(obj, 'underName', 'name') || ''], ['🔖 Reference', ref]],
     links: [['Manage booking', bcSchemaGet_(obj, 'url') || '']],
+    _src: 'schema.org departureTime=' + rf.departureTime + ' arrivalTime=' + (rf.arrivalTime || '') + ' | ' + depCity + ' (' + depCode + ') → ' + arrCity + ' (' + arrCode + ')',
   };
 }
 
@@ -116,6 +117,7 @@ function bcSchemaTrain_(obj, domain) {
     location: depCity,
     details: [['Departure', depCity], ['Arrival', arrCity], ['Passenger', bcSchemaGet_(obj, 'underName', 'name') || ''], ['🔖 Reference', ref]],
     links: [['Manage booking', bcSchemaGet_(obj, 'url') || '']],
+    _src: 'schema.org departureTime=' + rf.departureTime + ' arrivalTime=' + (rf.arrivalTime || '') + ' | ' + depCity + ' → ' + arrCity,
   };
 }
 
@@ -132,6 +134,7 @@ function bcSchemaLodging_(obj, domain) {
     location: name,
     details: [['Accommodation', name], ['Check-in', checkin.slice(0, 10)], ['Check-out', checkout ? checkout.slice(0, 10) : ''], ['🔖 Reference', ref]],
     links: [['Manage booking', bcSchemaGet_(obj, 'url') || '']],
+    _src: 'schema.org checkin=' + (obj.checkinDate || obj.checkinTime || '') + ' checkout=' + (obj.checkoutDate || obj.checkoutTime || ''),
   };
 }
 
@@ -174,6 +177,7 @@ function bcSchemaEventRes_(obj, domain) {
     location: [locName, address].filter(Boolean).join(', '),
     details: [['Event', title], ['Venue', locName], ['Address', address], ['🔖 Reference', ref], ['Passenger', bcSchemaGet_(obj, 'underName', 'name') || '']],
     links: [['Tickets', bcSchemaGet_(obj, 'ticketDownloadUrl') || ''], ['Manage booking', bcSchemaGet_(obj, 'url') || bcSchemaGet_(obj, 'modifyReservationUrl') || '']],
+    _src: 'schema.org startDate=' + ((isObj ? rf.startDate : null) || obj.startDate || '') + ' endDate=' + ((isObj ? rf.endDate : null) || obj.endDate || ''),
   };
 }
 
@@ -190,6 +194,7 @@ function bcSchemaFood_(obj, domain) {
     location: name,
     details: [['Restaurant', name], ['🔖 Reference', ref]],
     links: [['Details', bcSchemaGet_(obj, 'url') || '']],
+    _src: 'schema.org startTime=' + (obj.startTime || ''),
   };
 }
 
@@ -202,7 +207,7 @@ function bcEventsFromIcs_(ctx) {
 
   for (const att of ctx.attachments) {
     if (/\.ics$/i.test(att.getName()) || /calendar|icalendar/i.test(att.getContentType())) {
-      try { bcParseAllIcs_(att.getDataAsString()).forEach(p => { const ev = bcIcsToEvent_(p, ctx, cat); if (ev) results.push(ev); }); } catch (e) {}
+      try { bcParseAllIcs_(att.getDataAsString()).forEach(p => { p.file = att.getName(); const ev = bcIcsToEvent_(p, ctx, cat); if (ev) results.push(ev); }); } catch (e) {}
     }
   }
   if (results.length) return results;
@@ -214,7 +219,7 @@ function bcEventsFromIcs_(ctx) {
   if (icsLink && !/doctolib|square\.|captainvet|\.app\//i.test(icsLink)) {
     try {
       const resp = UrlFetchApp.fetch(icsLink, { muteHttpExceptions: true });
-      if (resp.getResponseCode() === 200) bcParseAllIcs_(resp.getContentText()).forEach(p => { const ev = bcIcsToEvent_(p, ctx, cat); if (ev) results.push(ev); });
+      if (resp.getResponseCode() === 200) bcParseAllIcs_(resp.getContentText()).forEach(p => { p.file = icsLink; const ev = bcIcsToEvent_(p, ctx, cat); if (ev) results.push(ev); });
     } catch (e) {}
   }
   return results;
@@ -228,22 +233,45 @@ function bcIcsCategory_(ctx) {
 }
 
 function bcIcsToEvent_(parsed, ctx, cat) {
-  const isMedical = cat === 'appointment_medical';
   const rawTitle = parsed.summary || ctx.subject;
-  const dur = bcDefaultDuration[isMedical ? 'appointment' : (cat || 'event')] || 60;
+  const route = bcTransportEndpoints_([rawTitle, parsed.file, parsed.location]);
+  const resolved = cat || (route && route.cat) || 'event';
+  const isMedical = resolved === 'appointment_medical';
+  const dur = bcDefaultDuration[isMedical ? 'appointment' : resolved] || 60;
   // Also check the subject line and ICS description for a genre hint — a
   // ticket's title is often just an artist/act name with none. Deliberately
   // NOT the full email body: footers/widgets ("Chat with us") produce false
   // matches (e.g. "chat" tripping the pets/vet rule).
-  const emoji = bcPickEmoji_(cat || 'event', rawTitle + ' ' + (parsed.description || '') + ' ' + ctx.subject);
+  const dep = (route && route.dep) || '';
+  const arr = (route && route.arr) || '';
+  const emoji = bcPickEmoji_(resolved, (dep && arr ? dep + ' ' + arr : rawTitle) + ' ' + (parsed.description || '') + ' ' + ctx.subject);
+
+  // A missing DTEND is not a real arrival time. The description sometimes
+  // still states it ("Arrivée: … 08:57"). That clock is local to the arrival
+  // station: 08:57 at St Pancras is 09:57 in Paris, a 1h22 trip, not 22 min.
+  // A pure guess stays in the departure zone — labeling a Paris wall-clock
+  // with London turns "start + 3h" into a 4h block.
+  const fromDescription = !parsed.end && bcArrivalFromText_(parsed.description, parsed.start.dt);
+  const statedEnd = parsed.end?.dt || fromDescription;
+  const endEstimated = !statedEnd;
+  let tzStart = parsed.start.tz, tzEnd = parsed.end?.tz;
+  if (!tzStart) tzStart = bcLegTz_(dep) || BC.TIMEZONE;
+  if (endEstimated) tzEnd = tzStart;
+  else if (fromDescription) tzEnd = bcLegTz_(arr) || tzStart;
+  else if (!tzEnd) tzEnd = bcLegTz_(arr) || tzStart;
+  const endDt = statedEnd || bcPlusMin_(parsed.start.dt, dur);
+  const duration = (route && route.duration) || (statedEnd ? bcDurationLabel_(parsed.start.dt, endDt, tzStart, tzEnd) : '');
+
   return {
-    provider: 'ics', cat: cat || 'event', ref: parsed.uid || '',
-    title: emoji + ' ' + rawTitle,
-    start: parsed.start.dt, tzStart: parsed.start.tz || BC.TIMEZONE,
-    end: parsed.end?.dt || bcPlusMin_(parsed.start.dt, dur), tzEnd: parsed.end?.tz || BC.TIMEZONE,
-    location: parsed.location || '',
+    provider: 'ics', cat: resolved, ref: parsed.uid || '',
+    title: emoji + ' ' + (dep && arr ? dep + ' → ' + arr + (duration ? ' ' + duration : '') : rawTitle),
+    start: parsed.start.dt, tzStart,
+    end: endDt, tzEnd,
+    location: dep || parsed.location || '',
+    _endEstimated: endEstimated,
     details: parsed.description ? [['Details', parsed.description.slice(0, 300)]] : [],
     links: parsed.url ? [['Details', parsed.url]] : [],
+    _src: 'ics ' + (parsed.file || '') + ' DTSTART' + (parsed.rawStart || '') + ' → ' + parsed.start.dt + ' tz=' + parsed.start.tz + ' | DTEND' + (parsed.rawEnd || '') + ' → ' + (parsed.end ? parsed.end.dt + ' tz=' + parsed.end.tz : statedEnd ? 'description ' + statedEnd + ' tz=' + tzEnd : 'none') + ' | route "' + dep + '" / "' + arr + '"',
   };
 }
 
@@ -261,7 +289,12 @@ function bcGcalLinkToEvent_(url, ctx, cat) {
     // Subject only, not the full body — footers/widgets ("Chat with us")
     // produce false matches against the full text.
     const emoji = bcPickEmoji_(cat || 'event', rawTitle + ' ' + ctx.subject);
-    return { provider: 'ics', cat: cat || 'event', ref: '', title: emoji + ' ' + rawTitle, start: toLocal(dates[1]), tzStart: BC.TIMEZONE, end: toLocal(dates[2]), tzEnd: BC.TIMEZONE, location: params.location || '', details: [], links: ticketLink ? [['Download tickets', ticketLink.url]] : [] };
+    // Same floating-time problem as ICS attachments (see bcIcsLegTz_): a
+    // Google Calendar "add" link carries no per-leg TZID either.
+    const [depText, arrText] = bcSplitRoute_(rawTitle + ' ' + (params.location || ''));
+    const tzStart = datesUtc ? BC.TIMEZONE : (bcLegTz_(depText) || BC.TIMEZONE);
+    const tzEnd = datesUtc ? BC.TIMEZONE : (bcLegTz_(arrText || depText) || BC.TIMEZONE);
+    return { provider: 'ics', cat: cat || 'event', ref: '', title: emoji + ' ' + rawTitle, start: toLocal(dates[1]), tzStart, end: toLocal(dates[2]), tzEnd, location: params.location || '', details: [], links: ticketLink ? [['Download tickets', ticketLink.url]] : [], _src: 'gcal dates=' + rawDates + (datesUtc ? ' (UTC)' : ' (local)') + ' | route "' + depText + '" / "' + arrText + '"' };
   } catch (e) { return null; }
 }
 
@@ -307,7 +340,9 @@ function bcClaudeExtract_(ctx) {
   try {
     const resp = UrlFetchApp.fetch(cfg.url(apiKey, model), { method: 'post', muteHttpExceptions: true, headers: cfg.headers(apiKey), payload: cfg.payload(content, model) });
     if (resp.getResponseCode() !== 200) { console.warn(name + ' error ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200)); return []; }
-    return bcAiParseResult_(cfg.extractText(JSON.parse(resp.getContentText())).trim(), name, model);
+    const aiText = cfg.extractText(JSON.parse(resp.getContentText())).trim();
+    bcTrace_('  AI raw: ' + aiText.slice(0, 1500));
+    return bcAiParseResult_(aiText, name, model);
   } catch(e) { console.warn(name + ' error: ' + e); return []; }
 }
 
@@ -316,8 +351,9 @@ function bcAiPrompt_(ctx) {
     'Extract booking/reservation events from this confirmation email.',
     'IMPORTANT: only extract events the recipient has CONFIRMED, PURCHASED or REGISTERED for. Return [] for newsletters, promotions, or "upcoming events" listings.',
     'Return ONLY a JSON array (empty if no booking). One object per event:',
-    '{"title":"short name","category":"flight|train|hotel|event|appointment_medical|appointment_personal","emoji":"single emoji","start":"YYYY-MM-DDTHH:MM:SS","end":"...or null","allDay":false,"location":"","reference":""}',
-    'Hotels: date-only strings (YYYY-MM-DD) and allDay:true. "start" is the check-in date, "end" is the check-out date — both are REQUIRED, never null, even if you have to infer checkout from a stated number of nights. All datetimes in ' + BC.TIMEZONE + '.',
+    '{"title":"short name","category":"flight|train|hotel|event|appointment_medical|appointment_personal","emoji":"single emoji","start":"YYYY-MM-DDTHH:MM:SS","end":"...or null","allDay":false,"location":"","destination":"","reference":""}',
+    'Hotels: date-only strings (YYYY-MM-DD) and allDay:true. "start" is the check-in date, "end" is the check-out date — both are REQUIRED, never null, even if you have to infer checkout from a stated number of nights.',
+    'For flight/train: "location" is the departure city/station/airport (include the IATA code in parentheses if given, e.g. "Paris (CDG)"), "destination" is the arrival city/station/airport likewise. Report "start" and "end" exactly as the LOCAL date & time printed for departure and arrival respectively — do NOT convert between timezones yourself, that is handled separately from "location"/"destination". For every other category, "destination" is not needed and all datetimes are in ' + BC.TIMEZONE + '.',
     '',
     'Subject: ' + ctx.subject,
     'From: ' + ctx.from,
@@ -331,16 +367,28 @@ function bcAiParseResult_(raw, providerName, model) {
     const parsed = JSON.parse(raw.match(/\[[\s\S]*\]/)[0]);
     return [].concat(parsed).filter(e => e && e.start).map(e => {
       const cat = e.category || 'event';
+      // Only flight/train have two different locations, so only those can
+      // need two different zones. The model is asked for literal local
+      // times per leg, not converted — our own IATA/city lookup resolves
+      // the actual zone from "location"/"destination" (an LLM doing
+      // timezone arithmetic itself is the unreliable part we're avoiding).
+      const isTransport = cat === 'train' || cat === 'flight';
+      const dep = e.location || '';
+      const arr = e.destination || '';
+      const tzStart = isTransport ? (bcLegTz_(dep) || BC.TIMEZONE) : BC.TIMEZONE;
+      const tzEnd = isTransport ? (bcLegTz_(arr || dep) || tzStart) : BC.TIMEZONE;
       return {
         provider: providerName, cat, ref: e.reference || '',
-        title: (e.emoji || bcPickEmoji_(cat, e.title)) + ' ' + (e.title || ''),
+        title: (e.emoji || bcPickEmoji_(cat, e.title)) + ' ' + (isTransport && dep && arr ? dep + ' → ' + arr : (e.title || '')),
         start: e.start, end: e.end || null, allDay: !!e.allDay,
         needsReview: cat === 'hotel' && !e.end,
-        tzStart: BC.TIMEZONE, tzEnd: BC.TIMEZONE,
-        location: e.location || '',
+        _endEstimated: !e.end,
+        tzStart, tzEnd: e.end ? tzEnd : tzStart,
+        location: isTransport ? dep : (e.location || ''),
         details: [['🔖 Reference', e.reference || '']],
         links: [],
         _aiModel: model,
+        _src: 'ai ' + JSON.stringify({ start: e.start, end: e.end, allDay: !!e.allDay, location: e.location || '', destination: e.destination || '', category: cat }),
       };
     }).filter(e => bcCategoryActive_(e.cat));
   } catch(e) { console.warn(providerName + ' parse error: ' + e); return []; }

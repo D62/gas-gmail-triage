@@ -99,13 +99,17 @@ function bcTicketsFolder_() {
   if (!id) throw new Error('TICKETS_FOLDER_ID is not set — add it via setupConfig().');
   return DriveApp.getFolderById(id);
 }
-function bcTzCity_(s) {
+// Returns null when nothing is recognized, unlike bcTzCity_ below — callers
+// that need to tell "no match" apart from "matched the home timezone" (e.g.
+// guessing a leg's zone from free text) use this one.
+function bcTzCityGuess_(s) {
   const n = bcNormalize_(s);
-  if (/londres|london|heathrow|gatwick|st pancras|stansted|luton|edinb|manchester/.test(n)) return 'Europe/London';
+  if (/londres|london|heathrow|gatwick|st.?\s?pancras|stansted|luton|edinb|manchester|glasgow|liverpool|birmingham/.test(n)) return 'Europe/London';
   if (/lisbonne|lisbon|\bporto\b|faro/.test(n)) return 'Europe/Lisbon';
   if (/dublin/.test(n)) return 'Europe/Dublin';
-  return BC.TIMEZONE;
+  return null;
 }
+function bcTzCity_(s) { return bcTzCityGuess_(s) || BC.TIMEZONE; }
 const bcIataTz = {
   LHR:'Europe/London', LGW:'Europe/London', STN:'Europe/London', LTN:'Europe/London', LCY:'Europe/London',
   MAN:'Europe/London', EDI:'Europe/London', GLA:'Europe/London', BHX:'Europe/London', DUB:'Europe/Dublin',
@@ -120,6 +124,127 @@ const bcIataTz = {
   ATH:'Europe/Athens', HEL:'Europe/Helsinki', RAK:'Africa/Casablanca', CMN:'Africa/Casablanca',
 };
 function bcTzIata_(code, city) { return bcIataTz[code] || bcTzCity_(city || ''); }
+
+// Best-effort timezone guess for ONE leg of a trip from free text (title,
+// location, or one half of a split route) — a known city/station name
+// first, then a bare 3-letter IATA code. Returns null (not a default) so
+// callers can tell "nothing recognized" apart from "recognized as home",
+// which matters when departure and arrival need different zones (e.g. a
+// Eurostar leaving Lille at 08:40 local and arriving London at 09:00 local
+// is a 1h20 trip, not 20 minutes — collapsing both ends to the same zone
+// silently produces the wrong duration).
+function bcLegTz_(text) {
+  const s = String(text || '');
+  const cityTz = bcTzCityGuess_(s);
+  if (cityTz) return cityTz;
+  const iata = s.match(/\b([A-Z]{3})\b/);
+  return iata ? (bcIataTz[iata[1]] || null) : null;
+}
+
+// "A → B" / "A - B" / "A to B" / "A vers B": splits a route-style string
+// into its two legs so each side can be resolved to its own timezone via
+// bcLegTz_ — mirrors the "dep → arr" title convention schema.org
+// train/flight events already use.
+function bcSplitRoute_(text) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  const m = s.match(/^(.+?)\s*(?:→|->|—|\bto\b|\bvers\b)\s*(.+)$/i);
+  return m ? [m[1], m[2]] : [s, ''];
+}
+
+function bcCleanStop_(s) {
+  return String(s || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*\([^)]*\)?\s*$/g, '')
+    .replace(/\s+\d{3,6}\s*$/g, '')
+    .trim();
+}
+
+// "(48 mins.)" or "(1 hour and 22 mins" (the closing paren is often lost
+// when a trailing "." + ")" is read as a file extension). Always return a
+// balanced "(...)".
+function bcTripDuration_(text) {
+  const raw = String(text || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ');
+  const m = raw.match(/\(\s*(\d[^)]*?)(?:\)|\s*$)/);
+  if (!m) return '';
+  const inner = m[1].replace(/[.\s]+$/g, '').trim();
+  if (!/\d/.test(inner) || !/min|hour|heure/i.test(inner)) return '';
+  return '(' + inner + ')';
+}
+
+// Some rail confirmations omit DTEND and put the arrival in the
+// description instead: "Arrivée: Mardi, 06 Octobre 2026, 07:33".
+// Returns a local datetime, or ''.
+function bcArrivalFromText_(text, startDt) {
+  const line = (String(text || '').match(/arriv(?:ée|ee|al)\s*:\s*([^\n]+)/i) || [])[1];
+  if (!line) return '';
+  const tm = line.match(/(\d{1,2})\s*[h:]\s*(\d{2})/);
+  if (!tm) return '';
+  let day = String(startDt || '').slice(0, 10);
+  const iso = line.match(/(\d{4})-(\d{2})-(\d{2})/);
+  const num = line.match(/(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})/);
+  const named = bcNormalize_(line).match(new RegExp('\\b(\\d{1,2})\\s+(' + bcMonthNamesRe + ')\\.?\\s+(\\d{4})'));
+  if (iso) day = iso[1] + '-' + iso[2] + '-' + iso[3];
+  else if (num) day = num[3] + '-' + bcPad_(+num[2]) + '-' + bcPad_(+num[1]);
+  else if (named && bcMonthMap[named[2]] != null) day = named[3] + '-' + bcPad_(bcMonthMap[named[2]] + 1) + '-' + bcPad_(+named[1]);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return '';
+  const end = day + 'T' + bcPad_(+tm[1]) + ':' + tm[2] + ':00';
+  const mins = (bcWallStartMs_(end) - bcWallStartMs_(startDt)) / 60000;
+  if (!isFinite(mins) || mins <= 0 || mins > 24 * 60) return '';
+  return end;
+}
+
+function bcDurationLabel_(start, end, tzStart, tzEnd) {
+  const mins = Math.round((bcInstantMs_(end, tzEnd || tzStart || BC.TIMEZONE) - bcInstantMs_(start, tzStart || BC.TIMEZONE)) / 60000);
+  if (!isFinite(mins) || mins <= 0 || mins >= 24 * 60) return '';
+  if (mins < 60) return '(' + mins + ' mins)';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  const hour = h === 1 ? '1 hour' : h + ' hours';
+  return '(' + (m ? hour + ' and ' + m + ' mins' : hour) + ')';
+}
+
+function bcRouteText_(t) {
+  let s = String(t).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (/\.ics$/i.test(s)) s = s.replace(/\.ics$/i, '');
+  return s;
+}
+
+// Rail/flight files rarely say "A → B" directly — corporate travel tools
+// tend to format it as e.g. "RAIL STATION A - STATION B 123456" or
+// "from STATION A -> STATION B (33 mins.)". Returns { cat, dep, arr,
+// duration } when the text is a transport leg. dep/arr are empty when the
+// category is clear but the two stops are not.
+function bcTransportEndpoints_(parts) {
+  const texts = [].concat(parts).filter(Boolean).map(bcRouteText_);
+  let duration = '';
+  for (const t of texts) duration = duration || bcTripDuration_(t);
+  let cat = null;
+  for (const t of texts) {
+    const n = bcNormalize_(t);
+    if (/\b(rail|train|sncf|eurostar|tgv|ouigo|thalys|ter)\b/.test(n)) cat = cat || 'train';
+    else if (/\b(flight|vol|airline|airways)\b/.test(n)) cat = cat || 'flight';
+  }
+  if (!cat) return null;
+  const grab = raw => {
+    const patterns = [
+      /\bfrom\s+(.+?)\s*(?:→|->|—)\s*(.+)$/i,
+      /^RAIL\s+(.+)\s+-\s+(.+?)(?:\s+\d{3,6})?$/i,
+      /^(.+?)\s*(?:→|->)\s*(.+)$/,
+    ];
+    for (const re of patterns) {
+      const m = raw.match(re);
+      if (!m) continue;
+      const dep = bcCleanStop_(m[1].replace(/^.*\bfrom\s+/i, ''));
+      const arr = bcCleanStop_(m[2]);
+      if (dep && arr) return [dep, arr];
+    }
+    return null;
+  };
+  for (const t of texts) {
+    const found = grab(t);
+    if (found) return { cat, dep: found[0], arr: found[1], duration };
+  }
+  return { cat, dep: '', arr: '', duration };
+}
 
 const bcIataContinent = {
   // Europe
@@ -247,13 +372,17 @@ function bcConnectionEv_(a, b, start, end) {
   };
 }
 
+// tz: null means "floating" (no Z, no usable TZID) — genuinely ambiguous
+// per the ICS spec. Callers that know the leg's location (departure vs
+// arrival) can do a better job than blindly defaulting to BC.TIMEZONE, so
+// this returns null instead of guessing here.
 function bcIcsDate_(v, params) {
   if (/^\d{8}$/.test(v)) return { dt: v.slice(0,4)+'-'+v.slice(4,6)+'-'+v.slice(6,8)+'T00:00:00', tz: BC.TIMEZONE };
   const m = v.match(/^(\d{8}T\d{6})(Z)?$/); if (!m) return null;
   if (m[2]) return { dt: bcUtcToLocal_(m[1]), tz: BC.TIMEZONE };
   const tz = (params.match(/TZID=([^;:]+)/) || [])[1];
   const dt = m[1].slice(0,4)+'-'+m[1].slice(4,6)+'-'+m[1].slice(6,8)+'T'+m[1].slice(9,11)+':'+m[1].slice(11,13)+':'+m[1].slice(13,15);
-  return { dt, tz: (tz && /^[A-Za-z_]+\/[A-Za-z_/-]+$/.test(tz)) ? tz : BC.TIMEZONE };
+  return { dt, tz: (tz && /^[A-Za-z_]+\/[A-Za-z_/-]+$/.test(tz)) ? tz : null };
 }
 
 function bcParseIcs_(txt) {
@@ -271,7 +400,11 @@ function bcParseAllIcs_(txt) {
     const s = field('DTSTART'); if (!s) continue;
     const start = bcIcsDate_(s.v, s.p); if (!start?.dt) continue;
     const e = field('DTEND'), l = field('LOCATION'), sum = field('SUMMARY'), uid = field('UID'), url = field('URL'), desc = field('DESCRIPTION');
-    results.push({ start, end: e ? bcIcsDate_(e.v, e.p) : null, location: l?.v || '', summary: sum?.v || '', uid: uid?.v || '', url: url?.v || '', description: desc ? desc.v.slice(0, 500) : '' });
+    results.push({
+      start, end: e ? bcIcsDate_(e.v, e.p) : null,
+      rawStart: (s.p || '') + ':' + s.v, rawEnd: e ? (e.p || '') + ':' + e.v : '',
+      location: l?.v || '', summary: sum?.v || '', uid: uid?.v || '', url: url?.v || '', description: desc ? desc.v.slice(0, 500) : '',
+    });
   }
   return results;
 }

@@ -44,3 +44,6 @@ const BC = {
   CALENDAR_ID: 'primary',
   TIMEZONE: 'Europe/Paris',
 };
+
+// Name of an event label that already exists on the calendar. '' leaves events unlabeled.
+const BC_LABEL = '';

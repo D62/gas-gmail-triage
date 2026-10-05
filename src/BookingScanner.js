@@ -8,10 +8,6 @@ function bcPickEmoji_(cat, title) {
   return bcEmoji[cat] || '📅';
 }
 
-// One message throwing (malformed source data, API hiccup, etc.) must never
-// abort the whole thread/batch — that would stop `_ckd` from ever being
-// applied, and the same broken message gets retried forever on every
-// trigger run. Isolate each message's processing instead.
 function bcForEachIncoming_(thread, fn) {
   const me = Session.getEffectiveUser().getEmail().toLowerCase();
   thread.getMessages().forEach(msg => {
@@ -24,6 +20,26 @@ function processBookings(thread) {
   bcForEachIncoming_(thread, msg => bcProcessMsg_(msg, false));
 }
 
+// Verbose date trace for manual runs only. runAll() leaves this off.
+var bcTraceOn_ = false;
+function bcTrace_(line) { if (bcTraceOn_) console.log(line); }
+
+function bcTraceEvent_(ctx, ev, layer, action) {
+  if (!bcTraceOn_) return;
+  let calendar = '';
+  try { calendar = JSON.stringify(bcEventTimeFields_(ev)); } catch (e) { calendar = 'time fields failed: ' + e; }
+  console.log([
+    'EVENT ' + action,
+    '  mail: ' + ctx.subject + ' | ' + ctx.from,
+    '  thread: ' + ctx.msg.getThread().getId(),
+    '  layer: ' + layer + ' | cat=' + (ev.cat || '') + (ev._isPreDeparture ? ' | blocker' : '') + (ev.allDay ? ' | allDay' : ''),
+    '  title: ' + ev.title,
+    '  source: ' + (ev._src || '(no raw source — derived blocker)'),
+    '  resolved: start=' + ev.start + ' tzStart=' + (ev.tzStart || '') + ' end=' + (ev.end || '') + ' tzEnd=' + (ev.tzEnd || '') + (ev.location ? ' | loc=' + ev.location : ''),
+    '  calendar: ' + calendar,
+  ].join('\n'));
+}
+
 function runBookingScanner({ days = 60, from = null, to = null, skipProcessed = true, simulate = false } = {}) {
   let q = '-in:sent -in:drafts -in:trash -in:spam';
   if (from || to) {
@@ -34,15 +50,27 @@ function runBookingScanner({ days = 60, from = null, to = null, skipProcessed = 
   }
   if (skipProcessed) q += ' -label:_ckd';
   q += ' (' + bcSubjects.map(s => 'subject:"' + s + '"').join(' OR ') + ' OR filename:ics OR (has:attachment filename:pdf))';
-  bcRunBatch_(q, simulate);
+  bcTraceOn_ = true;
+  try {
+    bcTrace_('SCAN simulate=' + !!simulate + '\n  q=' + q);
+    bcRunBatch_(q, simulate);
+  } finally {
+    bcTraceOn_ = false;
+  }
 }
 
 function processThread(threadId, simulate) {
   const thread = GmailApp.getThreadById(threadId);
   if (!thread) { console.error('Thread not found: ' + threadId); return; }
   const tally = bcTally_();
-  bcForEachIncoming_(thread, msg => bcProcessMsg_(msg, !!simulate, tally));
-  console.log(bcTallyStr_(tally, simulate ? '[DRY RUN] Thread ' + threadId : 'Thread ' + threadId));
+  bcTraceOn_ = true;
+  try {
+    bcTrace_('THREAD ' + threadId + ' simulate=' + !!simulate);
+    bcForEachIncoming_(thread, msg => bcProcessMsg_(msg, !!simulate, tally));
+    console.log(bcTallyStr_(tally, simulate ? '[DRY RUN] Thread ' + threadId : 'Thread ' + threadId));
+  } finally {
+    bcTraceOn_ = false;
+  }
 }
 
 // Schema.org/ICS run for the whole batch first; AI extraction (the expensive,
@@ -71,14 +99,16 @@ function bcTallyStr_(t, prefix) {
 function bcProcessMsg_(msg, simulate, tally, deferred) {
   if (!tally) tally = bcTally_();
   const ctx = bcBuildCtx_(msg);
-  if (!bcIsEligible_(ctx)) { tally.skipped++; return; }
+  bcTrace_('MSG "' + ctx.subject + '" from ' + ctx.from + ' | files: ' + (ctx.attachments.map(a => a.getName()).join(', ') || 'none'));
+  if (!bcIsEligible_(ctx)) { bcTrace_('  SKIP ineligible'); tally.skipped++; return; }
 
   let evs = bcEventsFromSchema_(ctx), layer = evs.length ? 'schema.org' : '';
   if (!evs.length) { evs = bcEventsFromIcs_(ctx); if (evs.length) layer = 'ics'; }
 
   if (!evs.length) {
-    if (deferred) { deferred.push({ ctx, simulate, tally }); return; }
-    if (bcAlreadyWellCovered_(ctx)) { tally.skipped++; return; }
+    if (!deferred && bcAttachTicketPdfs_(ctx, simulate)) { bcTrace_('  PDF attached to existing event'); tally.created++; return; }
+    if (deferred) { bcTrace_('  DEFER to AI'); deferred.push({ ctx, simulate, tally }); return; }
+    if (bcAlreadyWellCovered_(ctx)) { bcTrace_('  SKIP already on calendar'); tally.skipped++; return; }
     evs = bcClaudeExtract_(ctx);
     if (evs.length) layer = evs[0].provider + (evs[0]._aiModel ? ' (' + evs[0]._aiModel + ')' : '');
   }
@@ -87,7 +117,9 @@ function bcProcessMsg_(msg, simulate, tally, deferred) {
 }
 
 function bcProcessDeferred_({ ctx, simulate, tally }) {
-  if (bcAlreadyWellCovered_(ctx)) { tally.skipped++; return; }
+  if (bcAttachTicketPdfs_(ctx, simulate)) { bcTrace_('PDF "' + ctx.subject + '"\n  attached to existing event'); tally.created++; return; }
+  bcTrace_('AI "' + ctx.subject + '"');
+  if (bcAlreadyWellCovered_(ctx)) { bcTrace_('  SKIP already on calendar'); tally.skipped++; return; }
   const evs = bcClaudeExtract_(ctx);
   const layer = evs.length ? evs[0].provider + (evs[0]._aiModel ? ' (' + evs[0]._aiModel + ')' : '') : '';
   bcFinishProcessing_(ctx, evs, layer, simulate, tally);
@@ -95,6 +127,7 @@ function bcProcessDeferred_({ ctx, simulate, tally }) {
 
 function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
   if (!evs.length) {
+    bcTrace_('  UNRECOGNISED');
     tally.unrecognised.push(ctx.subject + '  <' + ctx.from.replace(/.*<|>/g, '') + '>');
     return;
   }
@@ -105,6 +138,7 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
 
   if (simulate) {
     evs.forEach(e => {
+      bcTraceEvent_(ctx, e, layer, 'DRY RUN');
       const atts = bcPreviewAttachments_(ctx, e);
       const desc = [
         ...e.details.filter(d => d[1]).map(d => d[0] + ': ' + d[1]),
@@ -121,23 +155,56 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
 
   evs.forEach(ev => {
     ev._key = bcEventKey_(ev);
-    const seenKey = ev.start.slice(0, 10) + '|' + bcNormalize_((ev.location || '').split(',')[0]).slice(0, 20);
-    if (tally.seen.includes(ev._key) || tally.seen.includes(seenKey)) return;
+    // Start minute + title, not day + place. Several ICS legs often share a
+    // day and an airport; collapsing on location kept only the first title.
+    const seenKey = bcInstantMs_(ev.start, ev.tzStart) + '|' + bcNormalize_(ev.title).replace(/\s*\([^)]*\)?\s*$/g, '').trim().slice(0, 60);
+    const duplicate = tally.seen.includes(ev._key) || tally.seen.includes(seenKey);
     const match = bcFindExisting_(ev._key, ev);
+    const incomingReal = !!(ev.end && !ev._endEstimated);
+    // Same route already handled in this run. Still let a real arrival
+    // through when the calendar copy is only start + default duration: one
+    // source's file (no DTEND) may be processed before another's that
+    // states the actual arrival time, and both share the same leg title.
+    if (duplicate && (!incomingReal || (match && bcExistingEndReal_(match.event, ev.cat)))) {
+      if (match) {
+        bcDropExtraTwins_(match.event, ev);
+        bcApplyLabel_(match.event.id);
+      }
+      bcTraceEvent_(ctx, ev, layer, 'SKIP duplicate in this run');
+      return;
+    }
     if (match) {
       const quality = bcEventQuality_(ev, layer);
-      if (quality > match.quality) {
+      const existingWhen = JSON.stringify(match.event.start) + ' → ' + JSON.stringify(match.event.end) + ' "' + (match.event.summary || '') + '"';
+      const existingReal = bcExistingEndReal_(match.event, ev.cat);
+      const incomingEnd = incomingReal ? bcInstantMs_(ev.end, ev.tzEnd || ev.tzStart) : NaN;
+      const existingEnd = bcInstantMs_(match.event.end, match.event.end?.timeZone);
+      // 08:57 stored as Paris is an hour earlier than 08:57 London. A source
+      // of equal quality may extend that arrival; it may not shrink a real one.
+      const endMoved = isFinite(incomingEnd) && isFinite(existingEnd) && incomingEnd - existingEnd > 5 * 60000;
+      const canReplace = incomingReal || !existingReal;
+      if ((incomingReal && !existingReal) || (endMoved && incomingReal && quality >= match.quality) || (quality > match.quality && canReplace)) {
+        bcTraceEvent_(ctx, ev, layer, 'UPGRADE ' + existingWhen);
         bcUpgradeEvent_(match.event, ev, ctx, bcSaveAttachments_(ctx, ev), layer, quality);
+        bcDropExtraTwins_(match.event, ev);
         tally.seen.push(ev._key, seenKey);
         tally.created++;
       } else if (!match.exact) {
+        bcTraceEvent_(ctx, ev, layer, 'ENRICH dates kept from ' + existingWhen);
         bcEnrichEvent_(match.event, ev, ctx, bcSaveAttachments_(ctx, ev), layer);
+        bcDropExtraTwins_(match.event, ev);
         tally.seen.push(ev._key, seenKey);
         tally.created++;
+      } else {
+        bcDropExtraTwins_(match.event, ev);
+        bcApplyLabel_(match.event.id);
+        bcTraceEvent_(ctx, ev, layer, 'SKIP same key as ' + existingWhen);
       }
       return;
     }
-    bcCreateEvent_(ev, ctx, bcSaveAttachments_(ctx, ev), layer);
+    bcTraceEvent_(ctx, ev, layer, 'CREATE');
+    const created = bcCreateEvent_(ev, ctx, bcSaveAttachments_(ctx, ev), layer);
+    if (created) bcDropExtraTwins_(created, ev);
     tally.seen.push(ev._key, seenKey);
     ev.needsReview ? tally.needsReview++ : tally.created++;
   });
@@ -145,9 +212,36 @@ function bcFinishProcessing_(ctx, evs, layer, simulate, tally) {
 
 /* ===================== LAYER 0 — ELIGIBILITY ===================== */
 
+// Google Calendar already adds the event when someone invites you. The
+// notification mail carries invite.ics (or comes from calendar-notification),
+// and treating that file as a booking creates a second copy.
+function bcIsGoogleCalendarInvite_(ctx) {
+  if (/calendar-notification@google\.com/i.test(ctx.from || '')) return true;
+  return (ctx.attachments || []).some(att => /^invite\.ics$/i.test(att.getName() || ''));
+}
+
+// Zoom, Teams, Webex and the other meeting products. A ticket that only
+// mentions a stream in the subject is kept; a mail that is itself the
+// join invitation, or whose only calendar file is one, is not.
+function bcIsVideoConferenceInvite_(ctx) {
+  const from = ctx.from || '';
+  if (bcVideoSenders.test(from) || bcVideoSenders.test(bcReconstructDomain_(from))) return true;
+  if (/billet|ticket|r[ée]servation|booking|flight|\bvol\b|train|h[oô]tel|sncf|eurostar/i.test(ctx.subject || '')) return false;
+  const opening = (ctx.subject || '') + '\n' + (ctx.lines || []).slice(0, 20).join('\n');
+  if (bcVideoInvite.test(opening) || bcVideoSenders.test(opening)) return true;
+  const ics = (ctx.attachments || []).filter(att => /\.ics$/i.test(att.getName() || ''));
+  if (!ics.length) return false;
+  return ics.every(att => {
+    let raw = '';
+    try { raw = att.getDataAsString().slice(0, 12000).replace(/\r?\n[ \t]/g, ''); } catch (e) { return false; }
+    return bcVideoInvite.test(raw) || bcVideoSenders.test(raw);
+  });
+}
+
 function bcIsEligible_(ctx) {
   const { subject, from, text, lines } = ctx;
   const domain = bcReconstructDomain_(from);
+  if (bcIsGoogleCalendarInvite_(ctx) || bcIsVideoConferenceInvite_(ctx)) return false;
   if (bcExclSenders.test(domain) || bcExclSenders.test(from)) return false;
   if (bcCalComSenders.test(domain) && !bcActiveCategories.meeting) return false;
   if (bcExclSubjects.some(re => re.test(subject))) return false;
