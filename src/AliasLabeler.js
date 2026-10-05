@@ -50,7 +50,7 @@ function labelAliasThread(thread) {
     }
 
     const gmailMatch = addr.match(gmailRegex);
-    if (gmailMatch && addr.toLowerCase().startsWith(gmailUser)) {
+    if (gmailMatch) {
       const plus = gmailMatch[2];
       const label = plus ? `@${gmailDomain}/${gmailUser}+${plus}` : `@${gmailDomain}/${gmailUser}`;
       getOrCreateLabel(label).addToThread(thread);
