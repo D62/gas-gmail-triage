@@ -105,6 +105,7 @@ function bcProcessMsg_(msg, simulate, tally, deferred) {
   if (!evs.length) {
     if (!deferred && bcAttachTicketPdfs_(ctx, simulate)) { bcTrace_('  PDF attached to existing event'); tally.created++; return; }
     if (deferred) { bcTrace_('  DEFER to AI'); deferred.push({ ctx, simulate, tally }); return; }
+    if (bcIsMarketingBlast_(ctx)) { bcTrace_('  SKIP marketing listing'); tally.skipped++; return; }
     if (bcAlreadyWellCovered_(ctx)) { bcTrace_('  SKIP already on calendar'); tally.skipped++; return; }
     evs = bcClaudeExtract_(ctx);
     if (evs.length) layer = evs[0].provider + (evs[0]._aiModel ? ' (' + evs[0]._aiModel + ')' : '');
@@ -116,6 +117,7 @@ function bcProcessMsg_(msg, simulate, tally, deferred) {
 function bcProcessDeferred_({ ctx, simulate, tally }) {
   if (bcAttachTicketPdfs_(ctx, simulate)) { bcTrace_('PDF "' + ctx.subject + '"\n  attached to existing event'); tally.created++; return; }
   bcTrace_('AI "' + ctx.subject + '"');
+  if (bcIsMarketingBlast_(ctx)) { bcTrace_('  SKIP marketing listing'); tally.skipped++; return; }
   if (bcAlreadyWellCovered_(ctx)) { bcTrace_('  SKIP already on calendar'); tally.skipped++; return; }
   const evs = bcClaudeExtract_(ctx);
   const layer = evs.length ? evs[0].provider + (evs[0]._aiModel ? ' (' + evs[0]._aiModel + ')' : '') : '';
@@ -241,6 +243,18 @@ function bcIsEligible_(ctx) {
   if (/ne fait pas office de validation/i.test(text)) return false;
   if (/votre avis sur|notez votre exp[ée]rience/i.test(text)) return false;
   return true;
+}
+
+// Several "get tickets"-style CTAs, or a bulk-sent mail spanning several dates,
+// with no confirmation wording — a listing of events, not a booking.
+function bcIsMarketingBlast_(ctx) {
+  const body = ctx.subject + '\n' + ctx.text;
+  if (bcBookingProof.test(body)) return false;
+  const ctas = (body.match(bcMarketingCta) || []).length;
+  const days = bcExtractDates_(body).length;
+  let bulk = false;
+  try { bulk = !!ctx.msg.getHeader('List-Unsubscribe'); } catch (e) {}
+  return ctas >= 3 || (ctas >= 1 && days >= 3) || (bulk && days >= 3);
 }
 
 function bcReconstructDomain_(from) {

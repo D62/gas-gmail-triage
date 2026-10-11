@@ -101,6 +101,12 @@ const bcExclSubjects = [
   /pre-?sale|on[- ]sale now|tickets?\s+(?:are|is)\s+live|VIP\s+(?:access|pre-?sale)|on-?sale\s+(?:alert|now)|pr[ée]vente|en vente (?:le|d[eè]s)|preventa|pr[ée]-venda|prevendita|Vorverkauf/i,
 ];
 
+// Marketing blasts listing several upcoming events (venue newsletters) — the AI
+// layer turns every listed date into an event, so they're stopped before it.
+const bcMarketingCta = /\b(?:get|buy|book)\s+(?:your\s+)?tickets?\b|\bbecome\s+a\s+member\b|\bpre-?sale\b|\bpublic\s+sale\b|\bon\s+sale\s+now\b|devenez\s+membre|r[ée]servez\s+(?:vos|votre|d[eè]s)|achetez\s+(?:vos|votre)\s+(?:billets?|places?)|prenez\s+vos\s+places|compra\s+(?:tus\s+)?entradas|hazte\s+socio/gi;
+// Phrases only a real confirmation carries; any of them overrides the marketing heuristic.
+const bcBookingProof = /confirmation\s+(?:number|code|#)|code\s+de\s+confirmation|booking\s+(?:reference|ref|number|code)|order\s+(?:number|no\.?|#|confirmed)|reservation\s+(?:number|code|confirmed)|thank\s+you\s+for\s+your\s+(?:order|purchase|booking|reservation)|num[ée]ro\s+de\s+(?:commande|r[ée]servation|dossier|billet)|r[ée]f[ée]rence\s+de\s+(?:r[ée]servation|commande|dossier)|merci\s+pour\s+votre\s+(?:commande|achat|r[ée]servation)|votre\s+(?:commande|r[ée]servation)\s+(?:est|a\s+[ée]t[ée])\s+confirm[ée]e|code\s+de\s+r[ée]servation|localizador|n[uú]mero\s+de\s+(?:pedido|reserva)/i;
+
 const bcEmojiContext = [
   [/barbier|coiffeur|haircut|barber|coupe.*barbe|hair/i, '💈'],
   [/dentiste?|dental/i, '🦷'],
