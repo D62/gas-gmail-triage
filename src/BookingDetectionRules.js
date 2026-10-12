@@ -107,6 +107,10 @@ const bcMarketingCta = /\b(?:get|buy|book)\s+(?:your\s+)?tickets?\b|\bbecome\s+a
 // Phrases only a real confirmation carries; any of them overrides the marketing heuristic.
 const bcBookingProof = /confirmation\s+(?:number|code|#)|code\s+de\s+confirmation|booking\s+(?:reference|ref|number|code)|order\s+(?:number|no\.?|#|confirmed)|reservation\s+(?:number|code|confirmed)|thank\s+you\s+for\s+your\s+(?:order|purchase|booking|reservation)|num[ée]ro\s+de\s+(?:commande|r[ée]servation|dossier|billet)|r[ée]f[ée]rence\s+de\s+(?:r[ée]servation|commande|dossier)|merci\s+pour\s+votre\s+(?:commande|achat|r[ée]servation)|votre\s+(?:commande|r[ée]servation)\s+(?:est|a\s+[ée]t[ée])\s+confirm[ée]e|code\s+de\s+r[ée]servation|localizador|n[uú]mero\s+de\s+(?:pedido|reserva)/i;
 
+// RSVP invites (webinars, alumni/club events) offer both — a purchase confirmation never does.
+const bcRsvpAccept = /\bje\s+m.inscris\b|\bi.m\s+attending\b|\bi.ll\s+be\s+there\b|\bcount\s+me\s+in\b|\bje\s+participe\b|\byes,?\s+i.ll\s+attend\b/i;
+const bcRsvpDecline = /\bd[ée]cliner\b|\bnot\s+attending\b|\bcan.?t\s+attend\b|\bje\s+ne\s+(?:peux|pourrai)\s+pas\b|\bno,?\s+i\s+can.?t\b/i;
+
 const bcEmojiContext = [
   [/barbier|coiffeur|haircut|barber|coupe.*barbe|hair/i, '💈'],
   [/dentiste?|dental/i, '🦷'],

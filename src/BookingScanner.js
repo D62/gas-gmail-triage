@@ -229,10 +229,16 @@ function bcIsVideoConferenceInvite_(ctx) {
   });
 }
 
+// Both an "I'm attending" and a "decline" CTA — only an unanswered RSVP invite has both.
+function bcIsRsvpInvite_(ctx) {
+  const body = ctx.subject + '\n' + ctx.text;
+  return bcRsvpAccept.test(body) && bcRsvpDecline.test(body);
+}
+
 function bcIsEligible_(ctx) {
   const { subject, from, text, lines } = ctx;
   const domain = bcReconstructDomain_(from);
-  if (bcIsGoogleCalendarInvite_(ctx) || bcIsVideoConferenceInvite_(ctx)) return false;
+  if (bcIsGoogleCalendarInvite_(ctx) || bcIsVideoConferenceInvite_(ctx) || bcIsRsvpInvite_(ctx)) return false;
   if (bcExclSenders.test(domain) || bcExclSenders.test(from)) return false;
   if (bcCalComSenders.test(domain) && !bcActiveCategories.meeting) return false;
   if (bcExclSubjects.some(re => re.test(subject))) return false;
